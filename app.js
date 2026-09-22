@@ -392,7 +392,7 @@ function rebuildState(){
         weekday: String(d.weekday||""),
         stay: String(d.stay||""),
         title: String(d.title||""),
-        items: Array.isArray(d.items) ? d.items : [],
+        items: itemsFromFirestore(d.items),
         tip: String(d.tip||"")
       });
     });
@@ -418,6 +418,20 @@ function rebuildState(){
   render();
 }
 
+/** Firestore doesn't support nested arrays, so [["2:30 PM","Temple..."], ...]
+    is stored as [{t:"2:30 PM", x:"Temple..."}, ...] and converted back to
+    tuples wherever the rest of the app expects the tuple shape. */
+function itemsToFirestore(items){
+  return items.map(function(it){ return { t: it[0]||"", x: it[1]||"" }; });
+}
+function itemsFromFirestore(items){
+  if(!Array.isArray(items)) return [];
+  return items.map(function(it){
+    if(Array.isArray(it)) return [String(it[0]||""), String(it[1]||"")]; // legacy shape, just in case
+    return [String((it&&it.t)||""), String((it&&it.x)||"")];
+  });
+}
+
 function seedItineraryOnce(){
   if(itinerarySeeded) return;
   itinerarySeeded = true;
@@ -426,7 +440,7 @@ function seedItineraryOnce(){
     var ref = db.collection("itinerary").doc("day" + d.day);
     batch.set(ref, {
       day: d.day, date: d.date, weekday: d.weekday, stay: d.stay,
-      title: d.title, items: d.items, tip: d.tip||""
+      title: d.title, items: itemsToFirestore(d.items), tip: d.tip||""
     }, { merge:true });
   });
   batch.commit().catch(function(err){ console.warn("Itinerary seed failed:", err); });
@@ -606,7 +620,7 @@ function updateItinerary(day, payload){
     }).filter(function(it){ return it[1]; });
     if(!title) throw new Error("Give this day a title.");
     return db.collection("itinerary").doc("day"+day).set({
-      day: day, title: title, stay: stay, tip: tip, items: items,
+      day: day, title: title, stay: stay, tip: tip, items: itemsToFirestore(items),
       updatedBy: S.me, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge:true });
   } catch(e){ return Promise.reject(e); }
