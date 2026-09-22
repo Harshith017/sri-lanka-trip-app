@@ -134,6 +134,20 @@ function catIcon(id){
   for(var i=0;i<CATEGORIES.length;i++) if(CATEGORIES[i].id===id) return CATEGORIES[i].icon;
   return "📌";
 }
+/** Builds a universal maps search link: opens the Google Maps app on
+    Android, Apple/Google Maps (whichever is set up) on iOS via the browser,
+    or Google Maps in a normal browser tab everywhere else. No platform
+    sniffing needed — https://maps.google.com links are handled natively by
+    both platforms' map apps when tapped. */
+function mapsUrl(place){
+  return "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(place);
+}
+function mapsBtnHtml(place, extraStyle){
+  if(!place) return "";
+  return '<a class="map-pin" href="'+esc(mapsUrl(place))+'" target="_blank" rel="noopener" '+
+    'title="Open in Maps" onclick="event.stopPropagation()" style="'+(extraStyle||"")+'">📍</a>';
+}
+
 function avatarHtml(email){
   var p = person(email);
   if(p.photo) return '<div class="avatar"><img src="'+esc(p.photo)+'" alt=""></div>';
@@ -152,9 +166,31 @@ function toast(msg, bad){
 /* ====================== Balance engine ====================== */
 
 /** Returns { email: amountOwedForThisBill } for one bill, honoring its split mode. */
+/** For itemized bills: sums each line item's per-person share across all
+    items. Each item is { desc, amount, people:[email,...], mode:"equal"|"percent", percents:{email:pct} }. */
+function itemizedShares(bill){
+  var shares = {};
+  (bill.items||[]).forEach(function(item){
+    var people = item.people||[];
+    if(!people.length) return;
+    if(item.mode === "percent" && item.percents){
+      people.forEach(function(e){
+        var pct = Number(item.percents[e])||0;
+        shares[e] = round2((shares[e]||0) + item.amount*(pct/100));
+      });
+    } else {
+      var share = round2(item.amount / people.length);
+      people.forEach(function(e){ shares[e] = round2((shares[e]||0) + share); });
+    }
+  });
+  return shares;
+}
+
 function billShares(b){
   var shares = {};
-  if(b.splitMode === "exact" && b.splitAmounts){
+  if(b.splitMode === "itemized" && Array.isArray(b.items)){
+    return itemizedShares(b);
+  } else if(b.splitMode === "exact" && b.splitAmounts){
     b.split.forEach(function(e){ shares[e] = round2(Number(b.splitAmounts[e])||0); });
   } else if(b.splitMode === "shares" && b.splitShares){
     var totalW = 0;
@@ -219,15 +255,54 @@ function validateBill(payload, peopleEmails){
   var desc = cleanText(payload && payload.desc, MAX_DESC_LEN);
   if(!desc) throw new Error("Add a short description for the bill.");
 
-  var amount = round2(payload && payload.amount);
-  if(!isFinite(amount) || amount<=0) throw new Error("Enter an amount greater than zero.");
-  if(amount > MAX_AMOUNT) throw new Error("That amount looks too large — check the digits.");
-
   var category = String((payload && payload.category) || "other").toLowerCase();
   if(VALID_CATEGORIES.indexOf(category)===-1) category = "other";
 
   var paidBy = normEmail(payload && payload.paidBy);
   if(peopleEmails.indexOf(paidBy)===-1) throw new Error("Whoever paid needs to have joined the trip first.");
+
+  var splitMode = String((payload && payload.splitMode) || "equal").toLowerCase();
+  if(["equal","exact","shares","itemized"].indexOf(splitMode)===-1) splitMode = "equal";
+
+  if(splitMode === "itemized"){
+    var rawItems = (payload && payload.items) || [];
+    if(!Array.isArray(rawItems) || !rawItems.length) throw new Error("Add at least one line item.");
+    var items = [], allPeople = [], total = 0;
+    for(var ii=0; ii<rawItems.length; ii++){
+      var ri = rawItems[ii];
+      var idesc = cleanText(ri.desc, MAX_DESC_LEN);
+      var iamt = round2(ri.amount);
+      if(!idesc) throw new Error("Every line item needs a name.");
+      if(!isFinite(iamt) || iamt<=0) throw new Error('Enter an amount for "'+idesc+'".');
+      var ipeople = Array.isArray(ri.people) ? ri.people.map(normEmail).filter(function(e){return e;}) : [];
+      ipeople = ipeople.filter(function(e,idx){ return ipeople.indexOf(e)===idx; });
+      if(!ipeople.length) throw new Error('Pick who shared "'+idesc+'".');
+      ipeople.forEach(function(e){
+        if(peopleEmails.indexOf(e)===-1) throw new Error("Everyone in the split needs to have joined the trip first.");
+        if(allPeople.indexOf(e)===-1) allPeople.push(e);
+      });
+      var imode = (ri.mode==="percent") ? "percent" : "equal";
+      var item = { desc:idesc, amount:iamt, people:ipeople, mode:imode };
+      if(imode==="percent"){
+        var pcts = {}, pctSum = 0;
+        ipeople.forEach(function(e){
+          var p = Number(ri.percents && ri.percents[e]);
+          if(!isFinite(p)||p<0) p = 0;
+          pcts[e]=p; pctSum += p;
+        });
+        if(Math.abs(pctSum-100) > 0.5) throw new Error('"'+idesc+'" percentages need to add up to 100% (currently '+Math.round(pctSum)+'%).');
+        item.percents = pcts;
+      }
+      items.push(item);
+      total = round2(total+iamt);
+    }
+    if(!allPeople.length) throw new Error("Pick at least one person across the line items.");
+    return { desc:desc, amount:total, category:category, paidBy:paidBy, split:allPeople, splitMode:"itemized", items:items };
+  }
+
+  var amount = round2(payload && payload.amount);
+  if(!isFinite(amount) || amount<=0) throw new Error("Enter an amount greater than zero.");
+  if(amount > MAX_AMOUNT) throw new Error("That amount looks too large — check the digits.");
 
   var rawSplit = (payload && payload.split) || [];
   if(!Array.isArray(rawSplit)) rawSplit = [];
@@ -240,9 +315,6 @@ function validateBill(payload, peopleEmails){
     }
   }
   if(!split.length) throw new Error("Pick at least one person to split this between.");
-
-  var splitMode = String((payload && payload.splitMode) || "equal").toLowerCase();
-  if(["equal","exact","shares"].indexOf(splitMode)===-1) splitMode = "equal";
 
   var out = { desc:desc, amount:amount, category:category, paidBy:paidBy, split:split, splitMode:splitMode };
 
@@ -357,6 +429,7 @@ function rebuildState(){
       splitMode: String(d.splitMode||"equal"),
       splitAmounts: d.splitAmounts || null,
       splitShares: d.splitShares || null,
+      items: Array.isArray(d.items) ? d.items : null,
       addedBy: normEmail(d.addedBy)
     });
   });
@@ -549,6 +622,7 @@ function addBill(payload){
       splitMode: bill.splitMode,
       splitAmounts: bill.splitAmounts || null,
       splitShares: bill.splitShares || null,
+      items: bill.items || null,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       deleted: false
@@ -567,6 +641,7 @@ function updateBill(id, payload){
       splitMode: bill.splitMode,
       splitAmounts: bill.splitAmounts || null,
       splitShares: bill.splitShares || null,
+      items: bill.items || null,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
   } catch(e){ return Promise.reject(e); }
@@ -755,7 +830,7 @@ function viewNow(){
   var pastCount = itemsWithTime.filter(function(x){ return x.t && x.t <= now; }).length;
 
   var upNext = nextItem
-    ? '<div class="now-hero-lbl">Up next</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(nextItem.it[1])+'</div><div class="now-hero-time">'+esc(nextItem.it[0])+'</div>'
+    ? '<div class="now-hero-lbl">Up next</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(nextItem.it[1])+mapsBtnHtml(nextItem.it[1],"margin-left:6px;")+'</div><div class="now-hero-time">'+esc(nextItem.it[0])+'</div>'
     : '<div class="now-hero-lbl">Today</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(d.title)+'</div>';
 
   var legIdx = d.day - 1; // DRIVE_LEGS[i] connects day i to day i+1
@@ -767,7 +842,7 @@ function viewNow(){
     var done = x.t && x.t <= now;
     var isNext = nextItem && x.it===nextItem.it;
     return '<div class="item-row'+(done?" now-done":"")+(isNext?" now-next":"")+'"><div class="item-time">'+esc(x.it[0])+'</div>'+
-      '<div class="item-text">'+esc(x.it[1])+(isNext?' <span class="now-badge">NEXT</span>':'')+'</div></div>';
+      '<div class="item-text">'+esc(x.it[1])+(isNext?' <span class="now-badge">NEXT</span>':'')+'</div>'+mapsBtnHtml(x.it[1])+'</div>';
   }).join("");
 
   return '<div class="card now-hero">'+upNext+
@@ -789,15 +864,17 @@ function viewItinerary(){
   var days = S.itinerary.map(function(d){
     var items = d.items.map(function(it){
       return '<div class="item-row"><div class="item-time">'+esc(it[0])+'</div>'+
-             '<div class="item-text">'+esc(it[1])+'</div></div>';
+             '<div class="item-text">'+esc(it[1])+'</div>'+
+             mapsBtnHtml(it[1])+'</div>';
     }).join("");
     var tip = d.tip ? '<div class="day-tip">📝 '+esc(d.tip)+'</div>' : "";
     var editBtn = '<button class="btn btn-ghost btn-sm" data-action="edit-day" data-day="'+d.day+'" style="margin-top:10px;">✏️ Edit this day</button>';
+    var stayPin = mapsBtnHtml(d.stay, "margin-left:6px;");
     return '<div class="day-card'+(d.day===openDay?" open":"")+'">'+
       '<button class="day-head" data-action="toggle-day" data-day="'+d.day+'">'+
         '<div class="day-num">'+d.day+'</div>'+
         '<div class="day-meta"><div class="d1">'+esc(d.title)+'</div>'+
-        '<div class="d2">'+esc(d.weekday+" "+d.date)+' · Stay: '+esc(d.stay)+'</div></div>'+
+        '<div class="d2">'+esc(d.weekday+" "+d.date)+' · Stay: '+esc(d.stay)+stayPin+'</div></div>'+
         '<div class="day-chev">⌄</div></button>'+
       '<div class="day-body"><div class="day-body-in">'+items+tip+editBtn+'</div></div></div>';
   }).join("");
@@ -844,11 +921,17 @@ function viewBills(){
     return String(b.createdAt).localeCompare(String(a.createdAt));
   });
   var rows = sorted.map(function(b){
-    var splitTxt = (b.split.length===S.people.length && S.people.length>0)
-      ? "split with everyone" : ("split "+b.split.length+" way"+(b.split.length===1?"":"s"));
-    if(b.splitMode && b.splitMode!=="equal") splitTxt += " · " + (b.splitMode==="exact"?"custom":"uneven");
+    var splitTxt;
+    if(b.splitMode==="itemized"){
+      var n = (b.items||[]).length;
+      splitTxt = n+" item"+(n===1?"":"s")+" · "+b.split.length+" people";
+    } else {
+      splitTxt = (b.split.length===S.people.length && S.people.length>0)
+        ? "split with everyone" : ("split "+b.split.length+" way"+(b.split.length===1?"":"s"));
+      if(b.splitMode && b.splitMode!=="equal") splitTxt += " · " + (b.splitMode==="exact"?"custom":"uneven");
+    }
     return '<div class="bill-row" data-action="open-bill" data-id="'+esc(b.id)+'">'+
-      '<div class="bill-icon">'+catIcon(b.category)+'</div>'+
+      '<div class="bill-icon">'+(b.splitMode==="itemized"?"🧾":catIcon(b.category))+'</div>'+
       '<div class="bill-mid"><div class="bill-desc">'+esc(b.desc)+'</div>'+
       '<div class="bill-sub">'+esc(pName(b.paidBy))+' paid · '+splitTxt+'</div></div>'+
       '<div class="bill-amt">'+inr(b.amount)+'</div></div>';
@@ -976,19 +1059,125 @@ function openProfileSheet(){
   );
 }
 
+/* ---- Receipt OCR (on-device, no server, no API key) ---- */
+
+var tesseractLoadPromise = null;
+function loadTesseract(){
+  if(window.Tesseract) return Promise.resolve();
+  if(tesseractLoadPromise) return tesseractLoadPromise;
+  tesseractLoadPromise = new Promise(function(resolve, reject){
+    var s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+    s.onload = function(){ resolve(); };
+    s.onerror = function(){ reject(new Error("Couldn't load the text scanner — check your connection.")); };
+    document.head.appendChild(s);
+  });
+  return tesseractLoadPromise;
+}
+
+/** Parses raw OCR text into candidate {desc, amount} lines: any line that
+    ends with (or contains) a plausible price gets its number pulled out,
+    the rest kept as the item description. Pure on-device heuristic, no AI —
+    the person reviews and picks which lines are real items next. */
+function parseReceiptLines(rawText){
+  var lines = String(rawText||"").split(/\r?\n/).map(function(l){ return l.trim(); }).filter(function(l){ return l.length>1; });
+  var priceRe = /(?:₹|rs\.?|inr)?\s*([0-9]{1,3}(?:[,.][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+\.[0-9]{2})\s*$/i;
+  var out = [];
+  lines.forEach(function(line){
+    var m = priceRe.exec(line);
+    if(!m) return;
+    var numStr = m[1].replace(/,/g,"");
+    var amount = round2(parseFloat(numStr));
+    if(!isFinite(amount) || amount<=0 || amount>MAX_AMOUNT) return;
+    var desc = cleanText(line.slice(0, m.index), MAX_DESC_LEN);
+    if(!desc) desc = "Item";
+    // Skip obvious non-item lines (totals/tax/change are still useful to see, so keep them —
+    // the person filters in the review step, we don't guess here).
+    out.push({ desc:desc, amount:amount, raw:line });
+  });
+  return out;
+}
+
+function scanReceiptImage(file, btn){
+  if(btn) btn.disabled = true;
+  toast("Reading receipt…");
+  return loadTesseract().then(function(){
+    return Tesseract.recognize(file, "eng");
+  }).then(function(result){
+    if(btn) btn.disabled = false;
+    var text = result && result.data && result.data.text || "";
+    return parseReceiptLines(text);
+  }).catch(function(err){
+    if(btn) btn.disabled = false;
+    throw err;
+  });
+}
+
+function openReceiptReviewSheet(candidates, onConfirm){
+  var picked = candidates.map(function(){ return true; }); // default: all selected
+
+  function renderList(){
+    return candidates.map(function(c, i){
+      return '<div class="split-row" data-role="cand-row" data-idx="'+i+'">'+
+        '<div class="chip'+(picked[i]?" on":"")+'" data-role="cand-toggle" data-idx="'+i+'" style="flex:1;text-align:left;display:flex;justify-content:space-between;">'+
+          '<span>'+esc(c.desc)+'</span><span style="margin-left:8px;">'+inr(c.amount)+'</span></div>'+
+      '</div>';
+    }).join("");
+  }
+
+  openSheetHtml(
+    '<h3>Receipt scanned</h3>'+
+    '<p class="muted" style="font-size:13px;line-height:1.5;margin-top:-8px;">Tap to keep or remove lines — this is on-device text recognition, so double-check the amounts before saving.</p>'+
+    '<div id="cand-list">'+renderList()+'</div>'+
+    '<div class="sheet-actions"><button class="btn btn-brand" id="cand-add">Add selected items</button></div>',
+    function(el){
+      function rerender(){ el.querySelector("#cand-list").innerHTML = renderList(); wire(); }
+      function wire(){
+        el.querySelectorAll('[data-role="cand-toggle"]').forEach(function(c){
+          c.addEventListener("click", function(){
+            var i = parseInt(c.dataset.idx,10);
+            picked[i] = !picked[i];
+            rerender();
+          });
+        });
+      }
+      wire();
+      el.querySelector("#cand-add").addEventListener("click", function(){
+        var chosen = candidates.filter(function(c,i){ return picked[i]; });
+        closeSheet();
+        onConfirm(chosen);
+      });
+    }
+  );
+}
+
 /* ---- Bill sheet ---- */
 
 var draftSplit = [], draftPaidBy = "", draftCat = "other", draftMode = "equal";
 var draftAmounts = {}, draftShares = {};
+var draftItems = []; // itemized mode: [{ localId, desc, amount, people:[email], mode:"equal"|"percent", percents:{} }]
+var draftItemSeq = 0;
 
-function openBillSheet(existing){
+function newDraftItem(desc, amount){
+  draftItemSeq++;
+  return { localId:"it"+draftItemSeq, desc:desc||"", amount:amount||0, people:S.people.map(function(p){return p.email;}), mode:"equal", percents:{} };
+}
+
+function openBillSheet(existing, resumeDraft){
   if(!S.people.length){ toast("Join the trip first", true); return; }
-  draftSplit = existing ? existing.split.slice() : S.people.map(function(p){ return p.email; });
-  draftPaidBy = existing ? existing.paidBy : S.me;
-  draftCat = existing ? existing.category : "other";
-  draftMode = existing ? (existing.splitMode || "equal") : "equal";
-  draftAmounts = existing && existing.splitAmounts ? Object.assign({}, existing.splitAmounts) : {};
-  draftShares = existing && existing.splitShares ? Object.assign({}, existing.splitShares) : {};
+  if(!resumeDraft){
+    draftSplit = existing ? existing.split.slice() : S.people.map(function(p){ return p.email; });
+    draftPaidBy = existing ? existing.paidBy : S.me;
+    draftCat = existing ? existing.category : "other";
+    draftMode = existing ? (existing.splitMode || "equal") : "equal";
+    draftAmounts = existing && existing.splitAmounts ? Object.assign({}, existing.splitAmounts) : {};
+    draftShares = existing && existing.splitShares ? Object.assign({}, existing.splitShares) : {};
+    draftItemSeq = 0;
+    draftItems = (existing && existing.items) ? existing.items.map(function(it){
+      draftItemSeq++;
+      return { localId:"it"+draftItemSeq, desc:it.desc, amount:it.amount, people:(it.people||[]).slice(), mode:it.mode||"equal", percents:Object.assign({},it.percents||{}) };
+    }) : [];
+  }
 
   var payChips = S.people.map(function(p){
     return '<div class="chip'+(draftPaidBy===p.email?" on":"")+'" data-role="paid" data-id="'+esc(p.email)+'">'+esc(p.name)+'</div>';
@@ -996,7 +1185,7 @@ function openBillSheet(existing){
   var catChips = CATEGORIES.map(function(c){
     return '<div class="chip'+(draftCat===c.id?" on":"")+'" data-role="cat" data-id="'+c.id+'">'+c.icon+' '+c.label+'</div>';
   }).join("");
-  var modeChips = [["equal","Equal"],["exact","Exact ₹"],["shares","Shares"]].map(function(m){
+  var modeChips = [["equal","Equal"],["exact","Exact ₹"],["shares","Shares"],["itemized","By item"]].map(function(m){
     return '<div class="chip'+(draftMode===m[0]?" on":"")+'" data-role="mode" data-id="'+m[0]+'">'+m[1]+'</div>';
   }).join("");
 
@@ -1019,16 +1208,59 @@ function openBillSheet(existing){
     return '<div id="b-split-chips">'+rows+'</div><div class="split-hint" id="b-hint"></div>';
   }
 
+  function itemTotal(){ return round2(draftItems.reduce(function(s,it){ return s+(Number(it.amount)||0); },0)); }
+
+  function renderItemsSection(){
+    if(!draftItems.length){
+      return '<div class="empty" style="padding:20px 10px;"><span class="big">🧾</span>No items yet<br>Scan a receipt or add items by hand.</div>';
+    }
+    return draftItems.map(function(it){
+      var peopleChips = S.people.map(function(p){
+        var on = it.people.indexOf(p.email)>=0;
+        return '<div class="chip'+(on?" on":"")+'" style="padding:6px 10px;font-size:12px;" data-role="item-person" data-item="'+it.localId+'" data-id="'+esc(p.email)+'">'+esc(p.name)+'</div>';
+      }).join("");
+      var modeToggle = '<button class="btn btn-ghost btn-sm" data-role="item-mode-toggle" data-item="'+it.localId+'" style="padding:5px 9px;font-size:11px;">'+(it.mode==="percent"?"% split":"Equal split")+'</button>';
+      var percentRow = "";
+      if(it.mode==="percent"){
+        var pctSum = 0; it.people.forEach(function(e){ pctSum += Number(it.percents[e])||0; });
+        percentRow = '<div style="margin-top:8px;">'+it.people.map(function(e){
+          return '<div class="split-row"><span style="flex:1;font-size:12.5px;">'+esc(pName(e))+'</span>'+
+            '<input type="number" inputmode="decimal" class="split-input" data-role="item-percent" data-item="'+it.localId+'" data-id="'+esc(e)+'" style="width:64px;" value="'+(it.percents[e]!=null?it.percents[e]:"")+'" placeholder="%"></div>';
+        }).join("")+'<div class="split-hint">'+Math.round(pctSum)+'% of '+inr(it.amount)+'</div></div>';
+      }
+      return '<div class="card" style="padding:12px 14px;margin-bottom:8px;" data-item-card="'+it.localId+'">'+
+        '<div style="display:flex;gap:8px;align-items:center;">'+
+          '<input type="text" class="split-input" data-role="item-desc" data-item="'+it.localId+'" style="flex:1;" maxlength="80" value="'+esc(it.desc)+'" placeholder="Item name">'+
+          '<div class="amount-field" style="width:96px;"><span class="rupee">₹</span>'+
+            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:20px;" value="'+(it.amount||"")+'" placeholder="0"></div>'+
+          '<button class="btn btn-line btn-sm" data-role="item-del" data-item="'+it.localId+'" style="padding:6px 9px;">✕</button>'+
+        '</div>'+
+        '<div class="chip-grid" style="margin-top:8px;">'+peopleChips+'</div>'+
+        '<div style="margin-top:8px;">'+modeToggle+'</div>'+
+        percentRow+
+      '</div>';
+    }).join("") + '<div class="split-hint" style="margin-top:4px;">Items total: '+inr(itemTotal())+'</div>';
+  }
+
   openSheetHtml(
     '<h3>'+(existing?"Edit bill":"Add a bill")+'</h3>'+
     '<div class="field"><label>What was it for</label>'+
       '<input type="text" id="b-desc" maxlength="80" placeholder="e.g. Dinner in Ella" value="'+(existing?esc(existing.desc):"")+'"></div>'+
-    '<div class="field"><label>Amount</label><div class="amount-field"><span class="rupee">₹</span>'+
+    '<div class="field" id="b-amount-field"><label>Amount</label><div class="amount-field"><span class="rupee">₹</span>'+
       '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+(existing?existing.amount:"")+'"></div></div>'+
     '<div class="field"><label>Category</label><div class="chip-grid">'+catChips+'</div></div>'+
     '<div class="field"><label>Who paid</label><div class="chip-grid">'+payChips+'</div></div>'+
     '<div class="field"><label>Split</label><div class="chip-grid" style="margin-bottom:10px;">'+modeChips+'</div>'+
-      '<div id="b-split-wrap">'+renderSplitSection()+'</div></div>'+
+      '<div id="b-split-wrap">'+(draftMode==="itemized" ? "" : renderSplitSection())+'</div>'+
+      '<div id="b-items-wrap" style="display:'+(draftMode==="itemized"?"block":"none")+';">'+
+        '<div style="display:flex;gap:8px;margin-bottom:10px;">'+
+          '<button class="btn btn-ghost btn-sm" id="b-scan-receipt">📷 Scan receipt</button>'+
+          '<button class="btn btn-ghost btn-sm" id="b-add-item">+ Add item</button>'+
+        '</div>'+
+        '<input type="file" id="b-receipt-input" accept="image/*" capture="environment" style="display:none;">'+
+        '<div id="b-items-list">'+renderItemsSection()+'</div>'+
+      '</div>'+
+    '</div>'+
     '<div class="sheet-actions">'+
       (existing?'<button class="btn btn-line" id="b-del">Delete</button>':'')+
       '<button class="btn btn-brand" id="b-save">'+(existing?"Save changes":"Save bill")+'</button>'+
@@ -1061,6 +1293,62 @@ function openBillSheet(existing){
         el.querySelector("#b-split-wrap").innerHTML = renderSplitSection();
         wireSplitSection();
         hint();
+      }
+
+      function rebuildItemsSection(){
+        el.querySelector("#b-items-list").innerHTML = renderItemsSection();
+        wireItemsSection();
+      }
+
+      function wireItemsSection(){
+        el.querySelectorAll('[data-role="item-desc"]').forEach(function(inp){
+          inp.addEventListener("input", function(){
+            var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
+            if(it) it.desc = inp.value;
+          });
+        });
+        el.querySelectorAll('[data-role="item-amount"]').forEach(function(inp){
+          inp.addEventListener("input", function(){
+            var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
+            if(it) it.amount = parseFloat(inp.value)||0;
+            var totalEl = el.querySelector("#b-items-list .split-hint:last-child");
+            if(totalEl) totalEl.textContent = "Items total: "+inr(itemTotal());
+          });
+        });
+        el.querySelectorAll('[data-role="item-person"]').forEach(function(c){
+          c.addEventListener("click", function(){
+            var it = draftItems.filter(function(x){return x.localId===c.dataset.item;})[0];
+            if(!it) return;
+            var idx = it.people.indexOf(c.dataset.id);
+            if(idx>=0){ if(it.people.length>1) it.people.splice(idx,1); }
+            else it.people.push(c.dataset.id);
+            rebuildItemsSection();
+          });
+        });
+        el.querySelectorAll('[data-role="item-mode-toggle"]').forEach(function(btn){
+          btn.addEventListener("click", function(){
+            var it = draftItems.filter(function(x){return x.localId===btn.dataset.item;})[0];
+            if(!it) return;
+            it.mode = it.mode==="percent" ? "equal" : "percent";
+            if(it.mode==="percent" && !Object.keys(it.percents).length){
+              var even = round2(100/it.people.length);
+              it.people.forEach(function(e){ it.percents[e]=even; });
+            }
+            rebuildItemsSection();
+          });
+        });
+        el.querySelectorAll('[data-role="item-percent"]').forEach(function(inp){
+          inp.addEventListener("input", function(){
+            var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
+            if(it) it.percents[inp.dataset.id] = parseFloat(inp.value)||0;
+          });
+        });
+        el.querySelectorAll('[data-role="item-del"]').forEach(function(btn){
+          btn.addEventListener("click", function(){
+            draftItems = draftItems.filter(function(x){return x.localId!==btn.dataset.item;});
+            rebuildItemsSection();
+          });
+        });
       }
 
       function wireSplitSection(){
@@ -1112,19 +1400,71 @@ function openBillSheet(existing){
           el.querySelectorAll('[data-role="mode"]').forEach(function(x){
             x.classList.toggle("on", x.dataset.id===draftMode);
           });
-          rebuildSplitSection();
+          var isItemized = draftMode==="itemized";
+          el.querySelector("#b-amount-field").style.display = isItemized ? "none" : "block";
+          el.querySelector("#b-split-wrap").style.display = isItemized ? "none" : "block";
+          el.querySelector("#b-items-wrap").style.display = isItemized ? "block" : "none";
+          if(isItemized){
+            if(!draftItems.length) draftItems.push(newDraftItem("", amt()||0));
+            rebuildItemsSection();
+          } else {
+            rebuildSplitSection();
+          }
+        });
+      });
+
+      wireItemsSection();
+
+      var addItemBtn = el.querySelector("#b-add-item");
+      if(addItemBtn) addItemBtn.addEventListener("click", function(){
+        draftItems.push(newDraftItem("",0));
+        rebuildItemsSection();
+      });
+
+      var scanBtn = el.querySelector("#b-scan-receipt");
+      var receiptInput = el.querySelector("#b-receipt-input");
+      if(scanBtn) scanBtn.addEventListener("click", function(){ receiptInput.click(); });
+      if(receiptInput) receiptInput.addEventListener("change", function(){
+        var file = receiptInput.files && receiptInput.files[0];
+        if(!file) return;
+        scanReceiptImage(file, scanBtn).then(function(lines){
+          if(!lines.length){ toast("Couldn't find any text in that photo", true); return; }
+          // The review sheet replaces this bill sheet (only one sheet can be
+          // open at a time); reopen the bill sheet with the picked items
+          // merged in once the person confirms, so nothing is lost.
+          var existingSnapshot = existing;
+          openReceiptReviewSheet(lines, function(picked){
+            picked.forEach(function(p){ draftItems.push(newDraftItem(p.desc, p.amount)); });
+            draftMode = "itemized";
+            openBillSheet(existingSnapshot, true);
+            toast(picked.length+" item"+(picked.length===1?"":"s")+" added from receipt");
+          });
+        }).catch(function(err){
+          toast("Couldn't read that receipt: "+(err&&err.message?err.message:"try again"), true);
+        }).finally(function(){
+          receiptInput.value = "";
         });
       });
 
       el.querySelector("#b-save").addEventListener("click", function(){
         var payload = {
           desc: el.querySelector("#b-desc").value.trim(),
-          amount: parseFloat(el.querySelector("#b-amount").value),
-          category: draftCat, paidBy: draftPaidBy, split: draftSplit.slice(),
-          splitMode: draftMode, splitAmounts: draftAmounts, splitShares: draftShares
+          category: draftCat, paidBy: draftPaidBy,
+          splitMode: draftMode
         };
+        if(draftMode==="itemized"){
+          payload.items = draftItems.map(function(it){
+            return { desc:it.desc, amount:it.amount, people:it.people.slice(), mode:it.mode, percents:Object.assign({},it.percents) };
+          });
+          payload.amount = itemTotal(); // for the description-required check below only
+        } else {
+          payload.amount = parseFloat(el.querySelector("#b-amount").value);
+          payload.split = draftSplit.slice();
+          payload.splitAmounts = draftAmounts;
+          payload.splitShares = draftShares;
+        }
         if(!payload.desc){ toast("Add a short description", true); return; }
-        if(!(payload.amount > 0)){ toast("Enter an amount", true); return; }
+        if(!(payload.amount > 0)){ toast(draftMode==="itemized" ? "Add at least one item with an amount" : "Enter an amount", true); return; }
         try{
           if(existing) writeOp(updateBill(existing.id, payload), "Bill updated", this);
           else writeOp(addBill(payload), "Bill added", this);
