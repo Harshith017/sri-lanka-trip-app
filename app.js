@@ -130,7 +130,10 @@ function fetchLkrPerInr(ymd){
       if(cached && validRate(cached.rate)) return cached;
       throw new Error("Couldn't get the exchange rate (no signal?)");
     }
-    return fetch(urls[i]).then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+    var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
+    var timer = ctrl ? setTimeout(function(){ ctrl.abort(); }, 6000) : null;
+    return fetch(urls[i], ctrl ? { signal: ctrl.signal } : undefined).then(function(r){
+      if(timer) clearTimeout(timer); if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
       .then(function(j){
         var rate = j && j.inr && Number(j.inr.lkr);
         if(!validRate(rate)) throw new Error("bad rate");
@@ -524,6 +527,23 @@ function tsToIso(ts){
   return String(ts);
 }
 
+/** Rebuilds a stored line item field by field, so whatever is in the
+    database can only ever be plain numbers and strings when it reaches the UI. */
+function cleanStoredItem(it){
+  if(!it || typeof it !== "object") return null;
+  var amount = Number(it.amount);
+  if(!isFinite(amount) || amount <= 0) return null;
+  var people = Array.isArray(it.people) ? it.people.filter(function(e){ return typeof e === "string"; }).map(normEmail) : [];
+  var percents = {};
+  if(it.percents && typeof it.percents === "object"){
+    people.forEach(function(e){ var v = Number(it.percents[e]); if(isFinite(v)) percents[e] = v; });
+  }
+  var out = { desc: cleanText(it.desc, MAX_DESC_LEN), amount: round2(amount), people: people, mode: it.mode === "percent" ? "percent" : "equal", percents: percents };
+  var orig = Number(it.origAmount);
+  if(isFinite(orig) && orig > 0) out.origAmount = round2(orig);
+  return out;
+}
+
 function rebuildState(){
   var peopleSnap = latestSnapshots.people;
   var billsSnap = latestSnapshots.bills;
@@ -533,7 +553,9 @@ function rebuildState(){
   if(!peopleSnap || !billsSnap || !settlementsSnap || !itinerarySnap || !tripSnap) return; // wait for all
 
   var settings = cloneSettings(DEFAULT_SETTINGS);
+  var inviteCode = "";
   tripSnap.forEach(function(doc){
+    if(doc.id === "invite"){ var ic = doc.data().code; if(typeof ic === "string") inviteCode = ic; return; }
     if(doc.id !== "settings") return;
     var d = doc.data();
     if(ymdToDate(d.startDate)) settings.startDate = d.startDate;
@@ -541,6 +563,7 @@ function rebuildState(){
     settings.airportRate = validRate(d.airportRate) ? Number(d.airportRate) : null;
     if(d.budget && typeof d.budget === "object"){
       CATEGORIES.forEach(function(c){
+        if(!(c.id in d.budget)) return;   // keep the default for categories added later
         var v = Number(d.budget[c.id]);
         settings.budget[c.id] = (isFinite(v) && v >= 0) ? v : 0;
       });
@@ -563,7 +586,7 @@ function rebuildState(){
 
   var bills = [];
   billsSnap.forEach(function(doc){
-    var d = doc.data();
+    var d = doc.data({ serverTimestamps: "estimate" });
     if(d.deleted) return;
     var split = Array.isArray(d.split) ? d.split.map(normEmail).filter(function(e){return e!=="";}) : [];
     if(!split.length) return;
@@ -580,7 +603,7 @@ function rebuildState(){
       splitMode: String(d.splitMode||"equal"),
       splitAmounts: d.splitAmounts || null,
       splitShares: d.splitShares || null,
-      items: Array.isArray(d.items) ? d.items : null,
+      items: Array.isArray(d.items) ? d.items.map(cleanStoredItem).filter(Boolean) : null,
       currency: d.currency === "LKR" ? "LKR" : "INR",
       origAmount: (d.currency === "LKR" && Number(d.origAmount) > 0) ? Number(d.origAmount) : null,
       fx: (d.currency === "LKR" && d.fx && validRate(d.fx.rate)) ? d.fx : null,
@@ -591,7 +614,7 @@ function rebuildState(){
 
   var settlements = [];
   settlementsSnap.forEach(function(doc){
-    var d = doc.data();
+    var d = doc.data({ serverTimestamps: "estimate" });
     if(d.deleted) return;
     var amount = Number(d.amount);
     if(!isFinite(amount) || amount<=0) return;
@@ -633,6 +656,7 @@ function rebuildState(){
   var byDay = {};
   itinerary.forEach(function(d){ byDay[d.day] = d; });
   S.settings = settings;
+  S.inviteCode = inviteCode;
   var dated = [];
   for(var dn=1; dn<=tripLength(); dn++){
     var base = byDay[dn] || { day:dn, title:"Day "+dn, stay:"", items:[], tip:"", placeholder:true };
@@ -655,6 +679,7 @@ function rebuildState(){
   S.fetchedAt = new Date().toISOString();
 
   setSync("ok");
+  if(joined && !inviteCode) ensureInviteCode();
   if(!booted){
     if(!joined){
       // Only draw the join form once — later snapshots (other people adding
@@ -684,6 +709,42 @@ function itemsFromFirestore(items){
     if(Array.isArray(it)) return [String(it[0]||""), String(it[1]||"")]; // legacy shape, just in case
     return [String((it&&it.t)||""), String((it&&it.x)||"")];
   });
+}
+
+/* ---- Invite code ----
+   Joining needs the trip's invite code (Firestore rules compare it with
+   trip/invite, which only members can read). Anyone else who opens the link
+   and signs in with Google sees nothing but the join screen. */
+var inviteCreating = false;
+function makeInviteCode(){
+  var abc = "ABCDEFGHJKMNPQRSTUVWXYZ23456789", out = "", a = new Uint8Array(8);
+  crypto.getRandomValues(a);
+  for(var i=0;i<8;i++) out += abc[a[i] % abc.length];
+  return out;
+}
+function ensureInviteCode(){
+  if(inviteCreating) return;
+  inviteCreating = true;
+  db.collection("trip").doc("invite").set({ code: makeInviteCode(), updatedBy: S.me }, { merge:true })
+    .catch(function(err){ console.warn("Couldn't create invite code:", err && err.code); inviteCreating = false; });
+}
+function inviteLink(code){
+  return location.origin + location.pathname + "?code=" + encodeURIComponent(code || S.inviteCode || "");
+}
+function pendingInviteCode(){
+  var fromUrl = "";
+  try{ fromUrl = new URLSearchParams(location.search).get("code") || ""; }catch(e){}
+  if(fromUrl) lsSet("pw_invite", fromUrl);
+  return (fromUrl || lsGet("pw_invite") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+}
+
+function restartListeners(){
+  [unsubPeople, unsubBills, unsubSettlements, unsubItinerary, unsubTrip].forEach(function(u){ if(u) u(); });
+  unsubPeople = unsubBills = unsubSettlements = unsubItinerary = unsubTrip = null;
+  latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
+  joinShown = false;
+  showBootLoading();
+  startListeners();
 }
 
 function seedItineraryOnce(){
@@ -732,6 +793,10 @@ function startListeners(){
 }
 
 function serverFail(err){
+  if(!booted && err && err.code === "permission-denied"){
+    if(!joinShown){ joinShown = true; showJoinScreen(); }
+    return;
+  }
   setSync("err");
   var msg = (err && err.message) ? err.message : "Couldn't reach the trip database.";
   if(!booted){
@@ -811,14 +876,17 @@ function requireMember(){
 
 /* ---- Write actions (replace google.script.run calls) ---- */
 
-function joinTrip(name, upi){
+function joinTrip(name, upi, code){
   var cleanName = cleanText(name, MAX_NAME_LEN);
   var cleanUpi = cleanText(upi, MAX_UPI_LEN);
+  var cleanCode = String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   if(!cleanName) return Promise.reject(new Error("Add your name so the group knows who you are."));
+  if(!cleanCode) return Promise.reject(new Error("Enter the invite code from the trip organiser."));
   return db.collection("people").doc(docId(S.me)).set({
     name: cleanName,
     upi: cleanUpi,
     photo: S.myPhoto || "",
+    joinCode: cleanCode,
     joinedAt: firebase.firestore.FieldValue.serverTimestamp()
   }, { merge:true });
 }
@@ -1204,6 +1272,11 @@ function openTripSettingsSheet(){
 
   openSheetHtml(
     '<h3>Trip settings</h3>'+
+    '<div class="field"><label>Invite friends</label>'+
+      '<div class="invite-box"><div class="invite-code" id="ts-code">'+esc(S.inviteCode || "creating…")+'</div>'+
+        '<button class="btn btn-brand btn-sm" id="ts-share">Share invite link</button></div>'+
+      '<div class="split-hint">Anyone with this code can join and see the trip. '+
+        '<a href="#" id="ts-newcode">Make a new code</a> if it gets passed around — people who already joined stay in.</div></div>'+
     '<div style="display:flex;gap:10px;">'+
       '<div class="field" style="flex:1;"><label>Trip starts</label><input type="date" id="ts-start" value="'+esc(st.startDate)+'"></div>'+
       '<div class="field" style="flex:1;"><label>Trip ends</label><input type="date" id="ts-end" value="'+esc(st.endDate)+'"></div>'+
@@ -1217,6 +1290,27 @@ function openTripSettingsSheet(){
     '<div class="sheet-actions"><button class="btn btn-brand" id="ts-save">Save</button></div>',
     function(el){
       var startIn = el.querySelector("#ts-start"), endIn = el.querySelector("#ts-end");
+
+      el.querySelector("#ts-share").addEventListener("click", function(){
+        if(!S.inviteCode){ toast("Invite code is still being created — try again in a moment", true); return; }
+        var link = inviteLink(), text = "Join our Sri Lanka trip on Project W — invite code "+S.inviteCode;
+        if(navigator.share){
+          navigator.share({ title:"Project W", text:text, url:link }).catch(function(){});
+        } else if(navigator.clipboard){
+          navigator.clipboard.writeText(text+"\n"+link).then(function(){ toast("Invite link copied"); }, function(){ toast(link); });
+        } else toast(link);
+      });
+      var newArmed = false;
+      el.querySelector("#ts-newcode").addEventListener("click", function(e){
+        e.preventDefault();
+        if(!newArmed){ newArmed = true; this.textContent = "Tap again to replace the code"; return; }
+        var code = makeInviteCode(), a = this;
+        db.collection("trip").doc("invite").set({ code: code, updatedBy: S.me }, { merge:true }).then(function(){
+          el.querySelector("#ts-code").textContent = code;
+          a.textContent = "Make a new code"; newArmed = false;
+          toast("New invite code: "+code+" — the old one no longer works");
+        }).catch(function(err){ toast(friendlyError(err), true); });
+      });
 
       function lenHint(){
         var a = ymdToDate(startIn.value), b = ymdToDate(endIn.value);
@@ -1308,7 +1402,8 @@ function viewBalances(){
   var total = S.bills.reduce(function(s,b){ return s+b.amount; }, 0);
 
   return '<div class="card balance-hero"><div class="amt">'+heroAmt+'</div><div class="lbl">'+heroLbl+'</div></div>'+
-    '<div class="section-label">Everyone on the trip</div><div class="card">'+rows+'</div>'+
+    '<div class="section-label" style="display:flex;justify-content:space-between;align-items:center;">Everyone on the trip'+
+      '<button class="btn btn-ghost btn-sm" data-action="trip-settings">+ Invite friends</button></div><div class="card">'+rows+'</div>'+
     '<div class="muted" style="font-size:11.5px;padding:8px 2px;">'+
       inr(total)+' logged across '+S.bills.length+' bill'+(S.bills.length===1?"":"s")+
       ' · '+S.people.length+' people joined</div>';
@@ -1427,11 +1522,13 @@ function showJoinScreen(){
   var sp = document.getElementById("boot-spinner");
   if(sp) sp.style.display = "none";
   var bm = document.getElementById("boot-msg");
-  if(bm) bm.textContent = "You're signed in. Add your name to join the trip.";
+  if(bm) bm.textContent = "You're signed in. Enter the invite code and your name to join the trip.";
   var be = document.getElementById("boot-extra");
   if(be) be.innerHTML =
     '<div class="join-card">'+
       '<div class="join-email">'+(S.myPhoto?'<img src="'+esc(S.myPhoto)+'" alt="">':'')+'<span>'+esc(S.me)+'</span></div>'+
+      '<div class="field"><label>Invite code</label>'+
+        '<input type="text" id="j-code" placeholder="From the trip organiser" maxlength="12" autocapitalize="characters" autocomplete="off" value="'+esc(pendingInviteCode())+'"></div>'+
       '<div class="field"><label>Your name</label>'+
         '<input type="text" id="j-name" placeholder="How the group knows you" maxlength="40"></div>'+
       '<div class="field"><label>UPI ID <span class="muted">(optional — so others can pay you)</span></label>'+
@@ -1440,11 +1537,21 @@ function showJoinScreen(){
     '</div>';
   document.getElementById("j-go").addEventListener("click", function(){
     var name = document.getElementById("j-name").value.trim();
+    var code = document.getElementById("j-code").value.trim();
+    if(!code){ toast("Enter the invite code first", true); return; }
     if(!name){ toast("Add your name first", true); return; }
     var btn = this;
-    writeOp(joinTrip(name, document.getElementById("j-upi").value.trim()), "Welcome aboard", btn);
+    btn.disabled = true; btn.textContent = "Joining…";
+    joinTrip(name, document.getElementById("j-upi").value.trim(), code).then(function(){
+      lsSet("pw_invite", null);
+      toast("Welcome aboard");
+      restartListeners();   // now a member: the trip data can be read
+    }).catch(function(err){
+      btn.disabled = false; btn.textContent = "Join the trip";
+      toast(err && err.code === "permission-denied" ? "That invite code isn't right — check it with the organiser." : friendlyError(err), true);
+    });
   });
-  document.getElementById("j-name").focus();
+  document.getElementById(pendingInviteCode() ? "j-name" : "j-code").focus();
 }
 
 function openProfileSheet(){
@@ -1665,14 +1772,12 @@ var draftAmounts = {}, draftShares = {};
 var draftItems = []; // itemized mode: [{ localId, desc, amount, people:[email], mode:"equal"|"percent", percents:{} }]
 var draftItemSeq = 0;
 var draftDesc = "";
+var draftAmountText = null;   // typed amount kept across a receipt scan
 var draftCurrency = "INR", draftBillDate = "", draftFx = { rate:null, source:"day", date:null };
 var fxToken = 0;
 
-function defaultCurrency(){
-  var last = lsGet("pw_last_cur");
-  if(last === "INR" || last === "LKR") return last;
-  return isDuringTrip() ? "LKR" : "INR";
-}
+/** During the trip dates new bills start in LKR; before/after, in ₹. */
+function defaultCurrency(){ return isDuringTrip() ? "LKR" : "INR"; }
 
 function newDraftItem(desc, amount){
   draftItemSeq++;
@@ -1681,7 +1786,9 @@ function newDraftItem(desc, amount){
 
 function openBillSheet(existing, resumeDraft, autoScan){
   if(!S.people.length){ toast("Join the trip first", true); return; }
+  fxToken++;   // any rate lookup still running for a previous sheet is now void
   if(!resumeDraft){
+    draftAmountText = null;
     draftSplit = existing ? existing.split.slice() : S.people.map(function(p){ return p.email; });
     draftPaidBy = existing ? existing.paidBy : S.me;
     draftCat = existing ? existing.category : "other";
@@ -1754,14 +1861,14 @@ function openBillSheet(existing, resumeDraft, autoScan){
         var pctSum = 0; it.people.forEach(function(e){ pctSum += Number(it.percents[e])||0; });
         percentRow = '<div style="margin-top:8px;">'+it.people.map(function(e){
           return '<div class="split-row"><span style="flex:1;font-size:12.5px;">'+esc(pName(e))+'</span>'+
-            '<input type="number" inputmode="decimal" class="split-input" data-role="item-percent" data-item="'+it.localId+'" data-id="'+esc(e)+'" style="width:64px;" value="'+(it.percents[e]!=null?it.percents[e]:"")+'" placeholder="%"></div>';
+            '<input type="number" inputmode="decimal" class="split-input" data-role="item-percent" data-item="'+it.localId+'" data-id="'+esc(e)+'" style="width:64px;" value="'+esc(it.percents[e]!=null?it.percents[e]:"")+'" placeholder="%"></div>';
         }).join("")+'<div class="split-hint">'+Math.round(pctSum)+'% of '+cm(it.amount)+'</div></div>';
       }
       return '<div class="card" style="padding:12px 14px;margin-bottom:8px;" data-item-card="'+it.localId+'">'+
         '<div style="display:flex;gap:8px;align-items:center;">'+
           '<input type="text" class="split-input" data-role="item-desc" data-item="'+it.localId+'" style="flex:1;" maxlength="80" value="'+esc(it.desc)+'" placeholder="Item name">'+
           '<div class="amount-field" style="width:104px;"><span class="rupee cur-sym">'+curSymbol(draftCurrency)+'</span>'+
-            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:30px;" value="'+(it.amount||"")+'" placeholder="0"></div>'+
+            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:30px;" value="'+esc(it.amount||"")+'" placeholder="0"></div>'+
           '<button class="btn btn-line btn-sm" data-role="item-del" data-item="'+it.localId+'" style="padding:6px 9px;">✕</button>'+
         '</div>'+
         '<div class="chip-grid" style="margin-top:8px;">'+peopleChips+'</div>'+
@@ -1772,12 +1879,12 @@ function openBillSheet(existing, resumeDraft, autoScan){
   }
 
   // Firestore rules only let the person who added a bill change or delete it.
-  var readOnly = !!(existing && existing.addedBy && existing.addedBy !== S.me);
+  var readOnly = !!(existing && existing.addedBy !== S.me);
 
   openSheetHtml(
     '<h3>'+(readOnly ? "Bill details" : (existing?"Edit bill":"Add a bill"))+'</h3>'+
     (readOnly ? '' : '<button class="btn btn-brand btn-wide scan-cta" id="b-scan-top">📷 Scan bill — fills in items &amp; prices</button>')+
-    (readOnly ? '<div class="day-tip" style="margin:-4px 0 12px;font-style:normal;">Added by '+esc(pName(existing.addedBy))+' — only they can change or delete it.</div>' : '')+
+    (readOnly ? '<div class="day-tip" style="margin:-4px 0 12px;font-style:normal;">'+(existing.addedBy ? 'Added by '+esc(pName(existing.addedBy))+' — only they can change or delete it.' : 'This bill can\'t be edited.')+'</div>' : '')+
     '<div class="field"><label>What was it for</label>'+
       '<input type="text" id="b-desc" maxlength="80" placeholder="e.g. Dinner in Ella" value="'+esc(resumeDraft ? draftDesc : (existing ? existing.desc : ""))+'"></div>'+
     '<div style="display:flex;gap:10px;">'+
@@ -1793,7 +1900,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
       '<div class="split-hint" id="b-fx-note"></div>'+
     '</div>'+
     '<div class="field" id="b-amount-field" style="display:'+(draftMode==="itemized"?"none":"block")+';"><label>Amount</label><div class="amount-field"><span class="rupee cur-sym">'+curSymbol(draftCurrency)+'</span>'+
-      '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+(existing ? (existing.currency==="LKR" && existing.origAmount ? existing.origAmount : existing.amount) : "")+'"></div><div class="split-hint" id="b-conv"></div></div>'+
+      '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+esc(resumeDraft && draftAmountText != null ? draftAmountText : (existing ? (existing.currency==="LKR" && existing.origAmount ? existing.origAmount : existing.amount) : ""))+'"></div><div class="split-hint" id="b-conv"></div></div>'+
     '<div class="field"><label>Category</label><div class="chip-grid">'+catChips+'</div></div>'+
     '<div class="field"><label>Who paid</label><div class="chip-grid">'+payChips+'</div></div>'+
     '<div class="field"><label>Split</label><div class="chip-grid" style="margin-bottom:10px;">'+modeChips+'</div>'+
@@ -1861,10 +1968,10 @@ function openBillSheet(existing, resumeDraft, autoScan){
         if(draftFx.source === "manual"){ fxStatus = validRate(draftFx.rate) ? "ok" : "none"; updateFxUI(); return; }
         fxStatus = "loading"; updateFxUI();
         fetchLkrPerInr(draftBillDate).then(function(r){
-          if(token !== fxToken) return;
+          if(token !== fxToken || openSheetEl !== el) return;
           draftFx = { rate:r.rate, source:"day", date:r.date }; fxStatus = "ok"; updateFxUI();
         }).catch(function(){
-          if(token !== fxToken) return;
+          if(token !== fxToken || openSheetEl !== el) return;
           if(validRate(S.settings.airportRate)){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "fellback"; }
           else { draftFx = { rate:null, source:"day", date:null }; fxStatus = "error"; }
           updateFxUI();
@@ -1873,7 +1980,11 @@ function openBillSheet(existing, resumeDraft, autoScan){
 
       el.querySelectorAll('[data-role="cur"]').forEach(function(c){
         c.addEventListener("click", function(){
+          if(c.dataset.id === draftCurrency) return;
+          fxToken++;
+          var typed = el.querySelector("#b-amount").value;
           draftCurrency = c.dataset.id;
+          if(typed) toast("Amount "+typed+" is now in "+(draftCurrency === "LKR" ? "LKR" : "₹")+" — check it's right");
           if(draftCurrency === "LKR" && !validRate(draftFx.rate)) resolveRate(); else updateFxUI();
         });
       });
@@ -1882,6 +1993,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
       });
       el.querySelector("#b-rate").addEventListener("input", function(){
         var v = parseFloat(this.value);
+        fxToken++;   // typing a rate beats any lookup still in flight
         draftFx = { rate: validRate(v) ? Math.round(v*10000)/10000 : null, source:"manual", date:draftBillDate };
         fxStatus = validRate(v) ? "ok" : "none";
         el.querySelectorAll('[data-role="fxsrc"]').forEach(function(x){ x.classList.remove("on"); });
@@ -2071,10 +2183,12 @@ function openBillSheet(existing, resumeDraft, autoScan){
           // at a time). Remember what's been typed so far, then reopen the
           // bill sheet with it intact — whether they add items or go back.
           draftDesc = el.querySelector("#b-desc").value;
-          draftMode = "itemized";
-          if(lines.lkr) draftCurrency = "LKR";
+          draftAmountText = el.querySelector("#b-amount").value;
           var existingSnapshot = existing;
+          var prevCurrency = draftCurrency;
+          if(lines.lkr) draftCurrency = "LKR";   // so the review list shows LKR
           openReceiptReviewSheet(lines, function(picked){
+            draftMode = "itemized";
             // Drop blank placeholder rows so they don't block saving.
             draftItems = draftItems.filter(function(it){ return String(it.desc).trim() || Number(it.amount) > 0; });
             picked.forEach(function(p){ draftItems.push(newDraftItem(p.desc, p.amount)); });
@@ -2082,6 +2196,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
             openBillSheet(existingSnapshot, true);
             toast(picked.length+" item"+(picked.length===1?"":"s")+" added — now tap who had each one");
           }, function(){
+            draftCurrency = prevCurrency;   // Back: nothing about the bill changes
             openBillSheet(existingSnapshot, true);
           });
         }).catch(function(err){
@@ -2263,12 +2378,17 @@ document.addEventListener("click", function(e){
   }
   else if(a==="copy-upi"){
     var upi = person(t.dataset.id).upi;
-    var ta = document.createElement("textarea");
-    ta.value = upi; ta.style.position="fixed"; ta.style.opacity="0";
-    document.body.appendChild(ta); ta.select();
-    try{ document.execCommand("copy"); toast("Copied "+upi); }
-    catch(err){ toast(upi); }
-    document.body.removeChild(ta);
+    function legacyCopy(){
+      var ta = document.createElement("textarea");
+      ta.value = upi; ta.setAttribute("readonly",""); ta.style.position="fixed"; ta.style.opacity="0";
+      document.body.appendChild(ta); ta.select(); ta.setSelectionRange(0, upi.length);
+      var ok = false; try{ ok = document.execCommand("copy"); }catch(err){}
+      document.body.removeChild(ta);
+      toast(ok ? "Copied "+upi : "UPI ID: "+upi+" (long-press to copy)");
+    }
+    if(navigator.clipboard && navigator.clipboard.writeText){
+      navigator.clipboard.writeText(upi).then(function(){ toast("Copied "+upi); }, legacyCopy);
+    } else legacyCopy();
   }
 });
 
