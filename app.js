@@ -425,7 +425,7 @@ function deleteSettlement(id){
 function buildShell(){
   document.getElementById("app").innerHTML =
     '<header class="topbar">'+
-      '<div class="topbar-row"><h1 class="trip-title">🇱🇰 Sri Lanka</h1>'+
+      '<div class="topbar-row"><h1 class="trip-title">🇱🇰 Project W</h1>'+
       '<div class="trip-dates">17–23 Nov</div></div>'+
       '<div class="route-line">Colombo Airport → Kandy → Nuwara Eliya → Ella → Mirissa → Galle → Colombo</div>'+
       '<div class="whoami">'+
@@ -803,7 +803,7 @@ document.addEventListener("click", function(e){
 function showSignIn(){
   document.getElementById("boot").innerHTML =
     '<div class="flag">🇱🇰</div>'+
-    '<h2>Sri Lanka Trip</h2>'+
+    '<h2>Project W</h2>'+
     '<p>Sign in with Google to see the itinerary and shared bills.</p>'+
     '<button class="google-btn" id="google-signin" style="margin-top:18px;max-width:280px;">'+
       '<img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" alt="">'+
@@ -829,7 +829,7 @@ auth.onAuthStateChanged(function(user){
   S.me = normEmail(user.email);
   S.myPhoto = user.photoURL || "";
   document.getElementById("boot").innerHTML =
-    '<div class="flag">🇱🇰</div><h2>Sri Lanka Trip</h2>'+
+    '<div class="flag">🇱🇰</div><h2>Project W</h2>'+
     '<p id="boot-msg">Loading the trip…</p>'+
     '<div class="spinner" id="boot-spinner"></div>'+
     '<div id="boot-extra"></div>';
