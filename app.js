@@ -1,6 +1,6 @@
 /* ====================== Trip content ====================== */
 
-var ITINERARY = [
+var SEED_ITINERARY = [
   { day:1, date:"17 Nov", weekday:"Tuesday", stay:"Kandy", title:"Colombo Airport → Kandy",
     items:[["Morning","Depart Bangalore, land in Colombo, pick up the rental car"],
            ["Morning","Drive to Kandy — about 3–3.5 hrs"],["1:30 PM","Lunch"],
@@ -60,18 +60,51 @@ var CATEGORIES = [
 var VALID_CATEGORIES = CATEGORIES.map(function(c){ return c.id; });
 var MAX_DESC_LEN = 80, MAX_NAME_LEN = 40, MAX_UPI_LEN = 60, MAX_AMOUNT = 10000000;
 
+// The itinerary dates (17–23 Nov) don't carry a year in the data — this is
+// the trip year they resolve against for the "Right Now" view's date math.
+var TRIP_YEAR = 2026;
+var MONTH_NUM = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+
+/** Parses a "17 Nov" style date string (from ITINERARY) into a real Date at local midnight. */
+function parseTripDate(dateStr){
+  var parts = String(dateStr||"").trim().split(/\s+/);
+  var dayNum = parseInt(parts[0],10);
+  var mon = MONTH_NUM[parts[1]];
+  if(!isFinite(dayNum) || mon===undefined) return null;
+  return new Date(TRIP_YEAR, mon, dayNum);
+}
+
+/** Parses an item's time label ("2:30 PM") against a given day's Date. Returns a Date or null for non-clock labels like "Morning"/"—". */
+function parseItemTime(baseDate, timeStr){
+  var m = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i.exec(String(timeStr||"").trim());
+  if(!m || !baseDate) return null;
+  var h = parseInt(m[1],10) % 12;
+  if(/pm/i.test(m[3])) h += 12;
+  var d = new Date(baseDate.getTime());
+  d.setHours(h, parseInt(m[2],10), 0, 0);
+  return d;
+}
+
 /* ====================== Firebase ====================== */
 
 var auth = firebase.auth();
 var db = firebase.firestore();
+try{
+  db.enablePersistence({ synchronizeTabs:true }).catch(function(err){
+    // Multiple tabs open, or browser doesn't support it — app still works,
+    // just without offline write queuing in that case.
+    console.warn("Offline persistence unavailable:", err && err.code);
+  });
+} catch(e){}
 
-var S = { me:"", myPhoto:"", joined:false, people:[], bills:[], settlements:[], fetchedAt:"" };
-var activeTab = "itinerary";
+var S = { me:"", myPhoto:"", joined:false, people:[], bills:[], settlements:[], itinerary:[], fetchedAt:"" };
+var activeTab = "now";
 var openDay = 1;
 var booted = false;
 var syncState = "ok";
-var unsubPeople = null, unsubBills = null, unsubSettlements = null;
-var latestSnapshots = { people:null, bills:null, settlements:null };
+var unsubPeople = null, unsubBills = null, unsubSettlements = null, unsubItinerary = null;
+var latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
+var itinerarySeeded = false;
 
 /* ====================== Helpers ====================== */
 
@@ -118,16 +151,36 @@ function toast(msg, bad){
 
 /* ====================== Balance engine ====================== */
 
+/** Returns { email: amountOwedForThisBill } for one bill, honoring its split mode. */
+function billShares(b){
+  var shares = {};
+  if(b.splitMode === "exact" && b.splitAmounts){
+    b.split.forEach(function(e){ shares[e] = round2(Number(b.splitAmounts[e])||0); });
+  } else if(b.splitMode === "shares" && b.splitShares){
+    var totalW = 0;
+    b.split.forEach(function(e){ totalW += Number(b.splitShares[e])||0; });
+    if(totalW <= 0) totalW = b.split.length;
+    b.split.forEach(function(e){
+      var w = (b.splitShares && Number(b.splitShares[e])) || 1;
+      shares[e] = round2(b.amount * (w/totalW));
+    });
+  } else {
+    var share = round2(b.amount / b.split.length);
+    b.split.forEach(function(e){ shares[e] = share; });
+  }
+  return shares;
+}
+
 function computeBalances(){
   var bal = {};
   S.people.forEach(function(p){ bal[p.email] = 0; });
   S.bills.forEach(function(b){
     if(bal[b.paidBy] === undefined) bal[b.paidBy] = 0;
     bal[b.paidBy] = round2(bal[b.paidBy] + b.amount);
-    var share = b.amount / b.split.length;
+    var shares = billShares(b);
     b.split.forEach(function(e){
       if(bal[e] === undefined) bal[e] = 0;
-      bal[e] = round2(bal[e] - share);
+      bal[e] = round2(bal[e] - (shares[e]||0));
     });
   });
   S.settlements.forEach(function(s){
@@ -188,7 +241,35 @@ function validateBill(payload, peopleEmails){
   }
   if(!split.length) throw new Error("Pick at least one person to split this between.");
 
-  return { desc:desc, amount:amount, category:category, paidBy:paidBy, split:split };
+  var splitMode = String((payload && payload.splitMode) || "equal").toLowerCase();
+  if(["equal","exact","shares"].indexOf(splitMode)===-1) splitMode = "equal";
+
+  var out = { desc:desc, amount:amount, category:category, paidBy:paidBy, split:split, splitMode:splitMode };
+
+  if(splitMode === "exact"){
+    var rawAmts = (payload && payload.splitAmounts) || {};
+    var amts = {}, sum = 0;
+    split.forEach(function(e){
+      var v = round2(rawAmts[e]);
+      if(!isFinite(v) || v<0) v = 0;
+      amts[e] = v; sum = round2(sum+v);
+    });
+    if(Math.abs(sum-amount) > 0.02) throw new Error("The exact amounts (" + inr(sum) + ") need to add up to the bill total (" + inr(amount) + ").");
+    out.splitAmounts = amts;
+  } else if(splitMode === "shares"){
+    var rawShares = (payload && payload.splitShares) || {};
+    var shares = {}, anyPositive = false;
+    split.forEach(function(e){
+      var v = Number(rawShares[e]);
+      if(!isFinite(v) || v<0) v = 0;
+      if(v>0) anyPositive = true;
+      shares[e] = v;
+    });
+    if(!anyPositive) throw new Error("Give at least one person a share greater than zero.");
+    out.splitShares = shares;
+  }
+
+  return out;
 }
 
 /* ====================== Firestore bridge ====================== */
@@ -196,8 +277,31 @@ function validateBill(payload, peopleEmails){
 function setSync(st){
   syncState = st;
   var dot = document.getElementById("sync-dot");
-  if(dot) dot.className = "sync-dot" + (st==="busy"?" busy":(st==="err"?" err":""));
+  if(dot) dot.className = "sync-dot" + (st==="busy"?" busy":(st==="err"?" err":(st==="offline"?" offline":"")));
+  updateOfflineBanner();
 }
+
+var isOffline = !navigator.onLine;
+var pendingWrites = 0;
+
+function updateOfflineBanner(){
+  var b = document.getElementById("offline-banner");
+  if(!b) return;
+  if(isOffline){
+    b.style.display = "flex";
+    b.querySelector(".ob-text").textContent = pendingWrites > 0
+      ? "Offline · " + pendingWrites + " change" + (pendingWrites===1?"":"s") + " will sync when you're back online"
+      : "Offline · you can still add bills, they'll sync later";
+  } else if(pendingWrites > 0){
+    b.style.display = "flex";
+    b.querySelector(".ob-text").textContent = "Syncing " + pendingWrites + " change" + (pendingWrites===1?"":"s") + "…";
+  } else {
+    b.style.display = "none";
+  }
+}
+
+window.addEventListener("online", function(){ isOffline = false; updateOfflineBanner(); });
+window.addEventListener("offline", function(){ isOffline = true; updateOfflineBanner(); });
 
 function docId(email){
   // Firestore doc IDs can't contain '/'; emails are otherwise safe.
@@ -218,7 +322,8 @@ function rebuildState(){
   var peopleSnap = latestSnapshots.people;
   var billsSnap = latestSnapshots.bills;
   var settlementsSnap = latestSnapshots.settlements;
-  if(!peopleSnap || !billsSnap || !settlementsSnap) return; // wait for all three
+  var itinerarySnap = latestSnapshots.itinerary;
+  if(!peopleSnap || !billsSnap || !settlementsSnap || !itinerarySnap) return; // wait for all four
 
   var people = [];
   peopleSnap.forEach(function(doc){
@@ -249,6 +354,9 @@ function rebuildState(){
       category: String(d.category||"other"),
       paidBy: normEmail(d.paidBy),
       split: split,
+      splitMode: String(d.splitMode||"equal"),
+      splitAmounts: d.splitAmounts || null,
+      splitShares: d.splitShares || null,
       addedBy: normEmail(d.addedBy)
     });
   });
@@ -269,12 +377,35 @@ function rebuildState(){
     });
   });
 
+  var itinerary = [];
+  if(itinerarySnap.empty){
+    // Nobody has synced the itinerary yet — fall back to the built-in seed
+    // data so the app still works, and seed Firestore once so edits persist.
+    itinerary = SEED_ITINERARY.slice();
+    seedItineraryOnce();
+  } else {
+    itinerarySnap.forEach(function(doc){
+      var d = doc.data();
+      itinerary.push({
+        day: Number(d.day)||0,
+        date: String(d.date||""),
+        weekday: String(d.weekday||""),
+        stay: String(d.stay||""),
+        title: String(d.title||""),
+        items: Array.isArray(d.items) ? d.items : [],
+        tip: String(d.tip||"")
+      });
+    });
+    itinerary.sort(function(a,b){ return a.day-b.day; });
+  }
+
   var joined = false;
   for(var i=0;i<people.length;i++) if(people[i].email===S.me){ joined = true; break; }
 
   S.people = people;
   S.bills = bills;
   S.settlements = settlements;
+  S.itinerary = itinerary;
   S.joined = joined;
   S.fetchedAt = new Date().toISOString();
 
@@ -285,6 +416,20 @@ function rebuildState(){
     buildShell();
   }
   render();
+}
+
+function seedItineraryOnce(){
+  if(itinerarySeeded) return;
+  itinerarySeeded = true;
+  var batch = db.batch();
+  SEED_ITINERARY.forEach(function(d){
+    var ref = db.collection("itinerary").doc("day" + d.day);
+    batch.set(ref, {
+      day: d.day, date: d.date, weekday: d.weekday, stay: d.stay,
+      title: d.title, items: d.items, tip: d.tip||""
+    }, { merge:true });
+  });
+  batch.commit().catch(function(err){ console.warn("Itinerary seed failed:", err); });
 }
 
 function startListeners(){
@@ -300,6 +445,11 @@ function startListeners(){
 
   unsubSettlements = db.collection("settlements").onSnapshot(function(snap){
     latestSnapshots.settlements = snap;
+    rebuildState();
+  }, function(err){ serverFail(err); });
+
+  unsubItinerary = db.collection("itinerary").onSnapshot(function(snap){
+    latestSnapshots.itinerary = snap;
     rebuildState();
   }, function(err){ serverFail(err); });
 }
@@ -319,17 +469,34 @@ function serverFail(err){
   }
 }
 
-/** Run a write against Firestore, show a toast, and close any open sheet. */
+/** Run a write against Firestore, show a toast, and close any open sheet.
+    Offline-aware: if the browser is offline, Firestore queues the write
+    locally (thanks to enablePersistence) and this promise won't resolve
+    until reconnect — so we close the sheet and show "queued" immediately
+    rather than looking stuck. */
 function writeOp(promise, okMsg, btn){
   if(btn) btn.disabled = true;
   setSync("busy");
+  pendingWrites++;
+  updateOfflineBanner();
+
+  if(isOffline){
+    closeSheet();
+    if(btn) btn.disabled = false;
+    toast((okMsg||"Saved") + " · queued offline");
+  }
+
   promise.then(function(){
     if(btn) btn.disabled = false;
+    pendingWrites = Math.max(0, pendingWrites-1);
     closeSheet();
     setSync("ok");
-    if(okMsg) toast(okMsg);
+    if(!isOffline && okMsg) toast(okMsg);
+    updateOfflineBanner();
   }).catch(function(err){
     if(btn) btn.disabled = false;
+    pendingWrites = Math.max(0, pendingWrites-1);
+    updateOfflineBanner();
     serverFail(err);
   });
 }
@@ -365,6 +532,9 @@ function addBill(payload){
     return db.collection("bills").doc(id).set({
       desc: bill.desc, amount: bill.amount, category: bill.category,
       paidBy: bill.paidBy, split: bill.split, addedBy: S.me,
+      splitMode: bill.splitMode,
+      splitAmounts: bill.splitAmounts || null,
+      splitShares: bill.splitShares || null,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       deleted: false
@@ -380,6 +550,9 @@ function updateBill(id, payload){
     return db.collection("bills").doc(id).update({
       desc: bill.desc, amount: bill.amount, category: bill.category,
       paidBy: bill.paidBy, split: bill.split,
+      splitMode: bill.splitMode,
+      splitAmounts: bill.splitAmounts || null,
+      splitShares: bill.splitShares || null,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
   } catch(e){ return Promise.reject(e); }
@@ -420,6 +593,25 @@ function deleteSettlement(id){
   } catch(e){ return Promise.reject(e); }
 }
 
+var MAX_ITEM_LEN = 90, MAX_TITLE_LEN = 60, MAX_STAY_LEN = 40, MAX_TIP_LEN = 140;
+
+function updateItinerary(day, payload){
+  try{
+    requireMember();
+    var title = cleanText(payload.title, MAX_TITLE_LEN);
+    var stay = cleanText(payload.stay, MAX_STAY_LEN);
+    var tip = cleanText(payload.tip, MAX_TIP_LEN);
+    var items = (payload.items||[]).map(function(it){
+      return [cleanText(it[0],20), cleanText(it[1], MAX_ITEM_LEN)];
+    }).filter(function(it){ return it[1]; });
+    if(!title) throw new Error("Give this day a title.");
+    return db.collection("itinerary").doc("day"+day).set({
+      day: day, title: title, stay: stay, tip: tip, items: items,
+      updatedBy: S.me, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge:true });
+  } catch(e){ return Promise.reject(e); }
+}
+
 /* ====================== Shell ====================== */
 
 function buildShell(){
@@ -433,9 +625,11 @@ function buildShell(){
         '<button id="btn-profile">Edit</button>'+
       '</div>'+
     '</header>'+
+    '<div class="offline-banner" id="offline-banner"><span class="ob-text"></span></div>'+
     '<main id="view"></main>'+
     '<button class="fab" id="fab" aria-label="Add a bill">+</button>'+
     '<nav class="tabbar" id="tabbar">'+
+      '<button class="tab-btn" data-tab="now"><span class="ic">📍</span>Now</button>'+
       '<button class="tab-btn" data-tab="itinerary"><span class="ic">🗓️</span>Plan</button>'+
       '<button class="tab-btn" data-tab="balances"><span class="ic">⚖️</span>Balances</button>'+
       '<button class="tab-btn" data-tab="bills"><span class="ic">🧾</span>Bills</button>'+
@@ -449,7 +643,12 @@ function buildShell(){
   document.getElementById("fab").addEventListener("click", function(){ openBillSheet(null); });
   document.getElementById("btn-profile").addEventListener("click", function(){ openProfileSheet(); });
 
+  updateOfflineBanner();
   setTab(activeTab);
+
+  // Keep the "Now" view fresh even if nobody touches the app — re-render
+  // every minute so "up next" and the countdown stay accurate.
+  setInterval(function(){ if(activeTab==="now") render(); }, 60000);
 }
 
 function setTab(tab){
@@ -457,7 +656,7 @@ function setTab(tab){
   var btns = document.querySelectorAll(".tab-btn");
   for(var i=0;i<btns.length;i++) btns[i].classList.toggle("active", btns[i].dataset.tab===tab);
   var fab = document.getElementById("fab");
-  if(fab) fab.style.display = (tab==="itinerary") ? "none" : "block";
+  if(fab) fab.style.display = (tab==="itinerary" || tab==="now") ? "none" : "block";
   render();
   var v = document.getElementById("view");
   if(v) v.scrollTop = 0;
@@ -468,13 +667,103 @@ function render(){
   var me = person(S.me);
   document.getElementById("me-label").textContent = me.name + (me.upi ? " · " + me.upi : "");
   var v = document.getElementById("view");
-  if(activeTab==="itinerary") v.innerHTML = viewItinerary();
+  if(activeTab==="now") v.innerHTML = viewNow();
+  else if(activeTab==="itinerary") v.innerHTML = viewItinerary();
   else if(activeTab==="balances") v.innerHTML = viewBalances();
   else if(activeTab==="bills") v.innerHTML = viewBills();
   else v.innerHTML = viewSettle();
 }
 
 /* ====================== Views ====================== */
+
+function viewNow(){
+  var now = new Date();
+  var days = S.itinerary.slice().sort(function(a,b){ return a.day-b.day; });
+  if(!days.length) return '<div class="empty"><span class="big">🗓️</span>No itinerary yet</div>';
+
+  var dated = days.map(function(d){ return { d:d, date: parseTripDate(d.date) }; }).filter(function(x){ return x.date; });
+  var tripStart = dated.length ? dated[0].date : null;
+  var tripEnd = dated.length ? new Date(dated[dated.length-1].date.getTime() + 24*3600*1000) : null;
+
+  var bal = computeBalances();
+  var mine = bal[S.me] || 0;
+  var balChip = Math.abs(mine)<0.005
+    ? '<div class="now-chip"><div class="nc-k">Balance</div><div class="nc-v pos">All square</div></div>'
+    : (mine>0
+      ? '<div class="now-chip"><div class="nc-k">You\'re owed</div><div class="nc-v pos">'+inr(mine)+'</div></div>'
+      : '<div class="now-chip"><div class="nc-k">You owe</div><div class="nc-v neg">'+inr(-mine)+'</div></div>');
+
+  // Not started yet — countdown hero.
+  if(!tripStart || now < tripStart){
+    var msLeft = tripStart ? (tripStart - now) : 0;
+    var daysLeft = Math.ceil(msLeft / (24*3600*1000));
+    return '<div class="card now-hero">'+
+        '<div class="now-hero-lbl">Trip starts in</div>'+
+        '<div class="now-hero-big">'+(tripStart? daysLeft : "?")+'<span class="now-hero-unit">'+(daysLeft===1?" day":" days")+'</span></div>'+
+        '<div class="now-hero-sub">'+esc(days[0].title)+' · '+esc(days[0].weekday+" "+days[0].date)+'</div>'+
+      '</div>'+
+      '<div class="now-chips">'+balChip+
+        '<div class="now-chip"><div class="nc-k">People joined</div><div class="nc-v">'+S.people.length+'</div></div>'+
+      '</div>'+
+      '<div class="section-label">First up</div>'+
+      '<div class="card">'+days[0].items.slice(0,4).map(function(it){
+        return '<div class="item-row"><div class="item-time">'+esc(it[0])+'</div><div class="item-text">'+esc(it[1])+'</div></div>';
+      }).join("")+'</div>';
+  }
+
+  // Trip finished.
+  if(tripEnd && now >= tripEnd){
+    var total = S.bills.reduce(function(s,b){ return s+b.amount; }, 0);
+    return '<div class="card now-hero">'+
+        '<div class="now-hero-lbl">🎉 Trip complete</div>'+
+        '<div class="now-hero-sub">'+inr(total)+' logged across '+S.bills.length+' bill'+(S.bills.length===1?"":"s")+'</div>'+
+      '</div>'+
+      '<div class="now-chips">'+balChip+'</div>'+
+      '<div class="muted" style="font-size:12.5px;padding:10px 2px;">Head to Settle to clear any last balances.</div>';
+  }
+
+  // Mid-trip — find today's day card by matching calendar date.
+  var todayEntry = dated.filter(function(x){
+    return x.date.getFullYear()===now.getFullYear() && x.date.getMonth()===now.getMonth() && x.date.getDate()===now.getDate();
+  })[0];
+
+  if(!todayEntry){
+    // Between listed days (shouldn't normally happen) — show nearest upcoming.
+    var upcoming = dated.filter(function(x){ return x.date > now; })[0] || dated[dated.length-1];
+    return '<div class="card now-hero"><div class="now-hero-lbl">On the road</div>'+
+      '<div class="now-hero-sub">Next: '+esc(upcoming.d.title)+'</div></div>'+
+      '<div class="now-chips">'+balChip+'</div>';
+  }
+
+  var d = todayEntry.d, baseDate = todayEntry.date;
+  var itemsWithTime = d.items.map(function(it){ return { it:it, t: parseItemTime(baseDate, it[0]) }; });
+  var nextItem = itemsWithTime.filter(function(x){ return x.t && x.t > now; })[0];
+  var pastCount = itemsWithTime.filter(function(x){ return x.t && x.t <= now; }).length;
+
+  var upNext = nextItem
+    ? '<div class="now-hero-lbl">Up next</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(nextItem.it[1])+'</div><div class="now-hero-time">'+esc(nextItem.it[0])+'</div>'
+    : '<div class="now-hero-lbl">Today</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(d.title)+'</div>';
+
+  var legIdx = d.day - 1; // DRIVE_LEGS[i] connects day i to day i+1
+  var legChip = (legIdx>=0 && legIdx<DRIVE_LEGS.length)
+    ? '<div class="now-chip"><div class="nc-k">Next drive</div><div class="nc-v">'+esc(DRIVE_LEGS[legIdx][1])+'</div></div>'
+    : '';
+
+  var restOfDay = itemsWithTime.map(function(x, i){
+    var done = x.t && x.t <= now;
+    var isNext = nextItem && x.it===nextItem.it;
+    return '<div class="item-row'+(done?" now-done":"")+(isNext?" now-next":"")+'"><div class="item-time">'+esc(x.it[0])+'</div>'+
+      '<div class="item-text">'+esc(x.it[1])+(isNext?' <span class="now-badge">NEXT</span>':'')+'</div></div>';
+  }).join("");
+
+  return '<div class="card now-hero">'+upNext+
+      '<div class="now-hero-foot">Day '+d.day+' of '+days.length+' · Staying in '+esc(d.stay)+'</div>'+
+    '</div>'+
+    '<div class="now-chips">'+balChip+legChip+'</div>'+
+    '<div class="section-label">Today\'s schedule</div>'+
+    '<div class="card">'+restOfDay+'</div>'+
+    (d.tip ? '<div class="day-tip" style="margin:10px 2px;">📝 '+esc(d.tip)+'</div>' : '');
+}
 
 function viewItinerary(){
   var legs = DRIVE_LEGS.map(function(l){
@@ -483,19 +772,20 @@ function viewItinerary(){
   var refs = BUDGET_REF.map(function(r){
     return '<div class="ref-chip"><div class="k">'+esc(r[0])+'</div><div class="v">'+esc(r[1])+'</div></div>';
   }).join("");
-  var days = ITINERARY.map(function(d){
+  var days = S.itinerary.map(function(d){
     var items = d.items.map(function(it){
       return '<div class="item-row"><div class="item-time">'+esc(it[0])+'</div>'+
              '<div class="item-text">'+esc(it[1])+'</div></div>';
     }).join("");
     var tip = d.tip ? '<div class="day-tip">📝 '+esc(d.tip)+'</div>' : "";
+    var editBtn = '<button class="btn btn-ghost btn-sm" data-action="edit-day" data-day="'+d.day+'" style="margin-top:10px;">✏️ Edit this day</button>';
     return '<div class="day-card'+(d.day===openDay?" open":"")+'">'+
       '<button class="day-head" data-action="toggle-day" data-day="'+d.day+'">'+
         '<div class="day-num">'+d.day+'</div>'+
         '<div class="day-meta"><div class="d1">'+esc(d.title)+'</div>'+
         '<div class="d2">'+esc(d.weekday+" "+d.date)+' · Stay: '+esc(d.stay)+'</div></div>'+
         '<div class="day-chev">⌄</div></button>'+
-      '<div class="day-body"><div class="day-body-in">'+items+tip+'</div></div></div>';
+      '<div class="day-body"><div class="day-body-in">'+items+tip+editBtn+'</div></div></div>';
   }).join("");
 
   return '<div class="section-label">Drive times</div><div class="ref-scroller">'+legs+'</div>'+
@@ -542,6 +832,7 @@ function viewBills(){
   var rows = sorted.map(function(b){
     var splitTxt = (b.split.length===S.people.length && S.people.length>0)
       ? "split with everyone" : ("split "+b.split.length+" way"+(b.split.length===1?"":"s"));
+    if(b.splitMode && b.splitMode!=="equal") splitTxt += " · " + (b.splitMode==="exact"?"custom":"uneven");
     return '<div class="bill-row" data-action="open-bill" data-id="'+esc(b.id)+'">'+
       '<div class="bill-icon">'+catIcon(b.category)+'</div>'+
       '<div class="bill-mid"><div class="bill-desc">'+esc(b.desc)+'</div>'+
@@ -673,23 +964,46 @@ function openProfileSheet(){
 
 /* ---- Bill sheet ---- */
 
-var draftSplit = [], draftPaidBy = "", draftCat = "other";
+var draftSplit = [], draftPaidBy = "", draftCat = "other", draftMode = "equal";
+var draftAmounts = {}, draftShares = {};
 
 function openBillSheet(existing){
   if(!S.people.length){ toast("Join the trip first", true); return; }
   draftSplit = existing ? existing.split.slice() : S.people.map(function(p){ return p.email; });
   draftPaidBy = existing ? existing.paidBy : S.me;
   draftCat = existing ? existing.category : "other";
+  draftMode = existing ? (existing.splitMode || "equal") : "equal";
+  draftAmounts = existing && existing.splitAmounts ? Object.assign({}, existing.splitAmounts) : {};
+  draftShares = existing && existing.splitShares ? Object.assign({}, existing.splitShares) : {};
 
   var payChips = S.people.map(function(p){
     return '<div class="chip'+(draftPaidBy===p.email?" on":"")+'" data-role="paid" data-id="'+esc(p.email)+'">'+esc(p.name)+'</div>';
   }).join("");
-  var splitChips = S.people.map(function(p){
-    return '<div class="chip'+(draftSplit.indexOf(p.email)>=0?" on":"")+'" data-role="split" data-id="'+esc(p.email)+'">'+esc(p.name)+'</div>';
-  }).join("");
   var catChips = CATEGORIES.map(function(c){
     return '<div class="chip'+(draftCat===c.id?" on":"")+'" data-role="cat" data-id="'+c.id+'">'+c.icon+' '+c.label+'</div>';
   }).join("");
+  var modeChips = [["equal","Equal"],["exact","Exact ₹"],["shares","Shares"]].map(function(m){
+    return '<div class="chip'+(draftMode===m[0]?" on":"")+'" data-role="mode" data-id="'+m[0]+'">'+m[1]+'</div>';
+  }).join("");
+
+  function renderSplitSection(){
+    if(draftMode === "equal"){
+      return '<div class="chip-grid" id="b-split-chips">'+S.people.map(function(p){
+        return '<div class="chip'+(draftSplit.indexOf(p.email)>=0?" on":"")+'" data-role="split" data-id="'+esc(p.email)+'">'+esc(p.name)+'</div>';
+      }).join("")+'</div><div class="split-hint" id="b-hint"></div>';
+    }
+    // exact or shares: a per-person row with an input, checkbox baked into inclusion
+    var rows = S.people.map(function(p){
+      var included = draftSplit.indexOf(p.email) >= 0;
+      var val = draftMode==="exact" ? (draftAmounts[p.email]!=null?draftAmounts[p.email]:"") : (draftShares[p.email]!=null?draftShares[p.email]:(included?1:""));
+      return '<div class="split-row" data-person="'+esc(p.email)+'">'+
+        '<div class="chip'+(included?" on":"")+'" data-role="split" data-id="'+esc(p.email)+'" style="flex:1;text-align:left;">'+esc(p.name)+'</div>'+
+        '<input type="number" inputmode="decimal" class="split-input" data-role="'+draftMode+'-input" data-id="'+esc(p.email)+'" '+
+          'style="width:84px;'+(included?"":"opacity:.4;")+'" placeholder="'+(draftMode==="exact"?"₹0":"1")+'" value="'+esc(val)+'" '+(included?"":"disabled")+'>'+
+        '</div>';
+    }).join("");
+    return '<div id="b-split-chips">'+rows+'</div><div class="split-hint" id="b-hint"></div>';
+  }
 
   openSheetHtml(
     '<h3>'+(existing?"Edit bill":"Add a bill")+'</h3>'+
@@ -699,19 +1013,66 @@ function openBillSheet(existing){
       '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+(existing?existing.amount:"")+'"></div></div>'+
     '<div class="field"><label>Category</label><div class="chip-grid">'+catChips+'</div></div>'+
     '<div class="field"><label>Who paid</label><div class="chip-grid">'+payChips+'</div></div>'+
-    '<div class="field"><label>Split between</label><div class="chip-grid">'+splitChips+'</div>'+
-      '<div class="split-hint" id="b-hint"></div></div>'+
+    '<div class="field"><label>Split</label><div class="chip-grid" style="margin-bottom:10px;">'+modeChips+'</div>'+
+      '<div id="b-split-wrap">'+renderSplitSection()+'</div></div>'+
     '<div class="sheet-actions">'+
       (existing?'<button class="btn btn-line" id="b-del">Delete</button>':'')+
       '<button class="btn btn-brand" id="b-save">'+(existing?"Save changes":"Save bill")+'</button>'+
     '</div>',
     function(el){
+      function amt(){ return parseFloat(el.querySelector("#b-amount").value) || 0; }
+
       function hint(){
-        var amt = parseFloat(el.querySelector("#b-amount").value) || 0;
-        el.querySelector("#b-hint").textContent = draftSplit.length
-          ? draftSplit.length+" people · "+inr(amt/draftSplit.length)+" each"
-          : "Pick at least one person";
+        var h = el.querySelector("#b-hint");
+        if(!h) return;
+        if(!draftSplit.length){ h.textContent = "Pick at least one person"; return; }
+        if(draftMode === "equal"){
+          h.textContent = draftSplit.length+" people · "+inr(amt()/draftSplit.length)+" each";
+        } else if(draftMode === "exact"){
+          var sum = 0; draftSplit.forEach(function(e){ sum += Number(draftAmounts[e])||0; });
+          var diff = round2(amt() - sum);
+          h.textContent = inr(sum)+" of "+inr(amt())+" assigned"+(Math.abs(diff)>0.01?" · "+(diff>0?inr(diff)+" left over":inr(-diff)+" over"):" · ✓ matches");
+        } else {
+          var totalW = 0; draftSplit.forEach(function(e){ totalW += Number(draftShares[e])||0; });
+          if(totalW<=0){ h.textContent = "Give at least one share"; return; }
+          var parts = draftSplit.map(function(e){
+            var w = Number(draftShares[e])||0;
+            return pName(e)+" "+inr(amt()*(w/totalW));
+          });
+          h.textContent = parts.join(" · ");
+        }
       }
+
+      function rebuildSplitSection(){
+        el.querySelector("#b-split-wrap").innerHTML = renderSplitSection();
+        wireSplitSection();
+        hint();
+      }
+
+      function wireSplitSection(){
+        el.querySelectorAll('[data-role="split"]').forEach(function(c){
+          c.addEventListener("click", function(){
+            var id = c.dataset.id, i = draftSplit.indexOf(id);
+            if(i>=0){ if(draftSplit.length>1) draftSplit.splice(i,1); }
+            else { draftSplit.push(id); if(draftMode==="shares" && draftShares[id]==null) draftShares[id]=1; }
+            rebuildSplitSection();
+          });
+        });
+        el.querySelectorAll('[data-role="exact-input"]').forEach(function(inp){
+          inp.addEventListener("input", function(){
+            draftAmounts[inp.dataset.id] = parseFloat(inp.value)||0;
+            hint();
+          });
+        });
+        el.querySelectorAll('[data-role="shares-input"]').forEach(function(inp){
+          inp.addEventListener("input", function(){
+            draftShares[inp.dataset.id] = parseFloat(inp.value)||0;
+            hint();
+          });
+        });
+      }
+
+      wireSplitSection();
       hint();
       el.querySelector("#b-amount").addEventListener("input", hint);
 
@@ -731,13 +1092,13 @@ function openBillSheet(existing){
           });
         });
       });
-      el.querySelectorAll('[data-role="split"]').forEach(function(c){
+      el.querySelectorAll('[data-role="mode"]').forEach(function(c){
         c.addEventListener("click", function(){
-          var id = c.dataset.id, i = draftSplit.indexOf(id);
-          if(i>=0){ if(draftSplit.length>1) draftSplit.splice(i,1); }
-          else draftSplit.push(id);
-          c.classList.toggle("on", draftSplit.indexOf(id)>=0);
-          hint();
+          draftMode = c.dataset.id;
+          el.querySelectorAll('[data-role="mode"]').forEach(function(x){
+            x.classList.toggle("on", x.dataset.id===draftMode);
+          });
+          rebuildSplitSection();
         });
       });
 
@@ -745,12 +1106,15 @@ function openBillSheet(existing){
         var payload = {
           desc: el.querySelector("#b-desc").value.trim(),
           amount: parseFloat(el.querySelector("#b-amount").value),
-          category: draftCat, paidBy: draftPaidBy, split: draftSplit.slice()
+          category: draftCat, paidBy: draftPaidBy, split: draftSplit.slice(),
+          splitMode: draftMode, splitAmounts: draftAmounts, splitShares: draftShares
         };
         if(!payload.desc){ toast("Add a short description", true); return; }
         if(!(payload.amount > 0)){ toast("Enter an amount", true); return; }
-        if(existing) writeOp(updateBill(existing.id, payload), "Bill updated", this);
-        else writeOp(addBill(payload), "Bill added", this);
+        try{
+          if(existing) writeOp(updateBill(existing.id, payload), "Bill updated", this);
+          else writeOp(addBill(payload), "Bill added", this);
+        } catch(e){ toast(e.message, true); }
       });
 
       var del = el.querySelector("#b-del");
@@ -759,6 +1123,76 @@ function openBillSheet(existing){
       });
 
       el.querySelector("#b-desc").focus();
+    }
+  );
+}
+
+/* ---- Day / itinerary edit sheet ---- */
+
+function openDayEditSheet(day){
+  var itemsHtml = day.items.map(function(it, i){
+    return '<div class="split-row" data-idx="'+i+'">'+
+      '<input type="text" class="split-input" data-role="item-time" data-idx="'+i+'" style="width:76px;" maxlength="20" value="'+esc(it[0])+'" placeholder="Time">'+
+      '<input type="text" class="split-input" data-role="item-text" data-idx="'+i+'" style="flex:1;" maxlength="90" value="'+esc(it[1])+'" placeholder="What\'s happening">'+
+      '<button class="btn btn-line btn-sm" data-role="item-del" data-idx="'+i+'" style="padding:6px 9px;">✕</button>'+
+      '</div>';
+  }).join("");
+
+  openSheetHtml(
+    '<h3>Edit Day '+day.day+'</h3>'+
+    '<div class="field"><label>Title</label><input type="text" id="d-title" maxlength="60" value="'+esc(day.title)+'"></div>'+
+    '<div class="field"><label>Staying in</label><input type="text" id="d-stay" maxlength="40" value="'+esc(day.stay)+'"></div>'+
+    '<div class="field"><label>Schedule</label><div id="d-items">'+itemsHtml+'</div>'+
+      '<button class="btn btn-ghost btn-sm" id="d-add-item" style="margin-top:4px;">+ Add item</button></div>'+
+    '<div class="field"><label>Tip <span class="muted">(optional)</span></label>'+
+      '<input type="text" id="d-tip" maxlength="140" value="'+esc(day.tip||"")+'"></div>'+
+    '<div class="sheet-actions"><button class="btn btn-brand" id="d-save">Save day</button></div>',
+    function(el){
+      var items = day.items.map(function(it){ return it.slice(); });
+
+      function renumber(){
+        el.querySelectorAll('[data-role="item-del"]').forEach(function(btn, i){
+          btn.dataset.idx = i;
+        });
+      }
+
+      function addItemRow(time, text){
+        var idx = items.length;
+        items.push([time||"", text||""]);
+        var row = document.createElement("div");
+        row.className = "split-row";
+        row.innerHTML =
+          '<input type="text" class="split-input" data-role="item-time" style="width:76px;" maxlength="20" value="'+esc(time||"")+'" placeholder="Time">'+
+          '<input type="text" class="split-input" data-role="item-text" style="flex:1;" maxlength="90" value="'+esc(text||"")+'" placeholder="What\'s happening">'+
+          '<button class="btn btn-line btn-sm" data-role="item-del" style="padding:6px 9px;">✕</button>';
+        el.querySelector("#d-items").appendChild(row);
+        wireRow(row, idx);
+      }
+
+      function wireRow(row, idx){
+        row.querySelector('[data-role="item-time"]').addEventListener("input", function(e){ items[idx][0] = e.target.value; });
+        row.querySelector('[data-role="item-text"]').addEventListener("input", function(e){ items[idx][1] = e.target.value; });
+        row.querySelector('[data-role="item-del"]').addEventListener("click", function(){
+          items[idx] = null;
+          row.remove();
+        });
+      }
+
+      el.querySelectorAll("#d-items .split-row").forEach(function(row, idx){ wireRow(row, idx); });
+      el.querySelector("#d-add-item").addEventListener("click", function(){ addItemRow("",""); });
+
+      el.querySelector("#d-save").addEventListener("click", function(){
+        var payload = {
+          title: el.querySelector("#d-title").value.trim(),
+          stay: el.querySelector("#d-stay").value.trim(),
+          tip: el.querySelector("#d-tip").value.trim(),
+          items: items.filter(function(it){ return it; })
+        };
+        if(!payload.title){ toast("Give this day a title", true); return; }
+        try{
+          writeOp(updateItinerary(day.day, payload), "Day "+day.day+" updated", this);
+        } catch(e){ toast(e.message, true); }
+      });
     }
   );
 }
@@ -774,6 +1208,12 @@ document.addEventListener("click", function(e){
     var d = parseInt(t.dataset.day,10);
     openDay = (openDay===d) ? 0 : d;
     render();
+  }
+  else if(a==="edit-day"){
+    var dayNum = parseInt(t.dataset.day,10);
+    for(var di=0;di<S.itinerary.length;di++){
+      if(S.itinerary[di].day===dayNum){ openDayEditSheet(S.itinerary[di]); break; }
+    }
   }
   else if(a==="open-bill"){
     for(var i=0;i<S.bills.length;i++){
@@ -969,7 +1409,9 @@ auth.onAuthStateChanged(function(user){
     if(unsubPeople) unsubPeople();
     if(unsubBills) unsubBills();
     if(unsubSettlements) unsubSettlements();
-    latestSnapshots = { people:null, bills:null, settlements:null };
+    if(unsubItinerary) unsubItinerary();
+    latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
+    itinerarySeeded = false;
     showSignIn();
     return;
   }
