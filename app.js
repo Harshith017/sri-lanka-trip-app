@@ -108,7 +108,8 @@ function fmtLkr(v){
   return "LKR " + Number(round2(v)).toLocaleString("en-US", { minimumFractionDigits:0, maximumFractionDigits:2 });
 }
 function money(v, cur){ return cur === "LKR" ? fmtLkr(v) : inr(v); }
-function curSymbol(cur){ return cur === "LKR" ? "රු" : "₹"; }
+function curSymbol(cur){ return cur === "LKR" ? "Rs" : "₹"; }
+function inrWhole(v){ return inr(Math.round(Number(v)||0)); }
 function lkrToInr(v, lkrPerInr){ return round2(Number(v) / Number(lkrPerInr)); }
 function validRate(r){ r = Number(r); return isFinite(r) && r >= 0.5 && r <= 50; }
 
@@ -995,7 +996,7 @@ function render(){
 function budgetChipHtml(){
   var b = budgetSummary();
   return '<div class="now-chip" data-action="goto-plan" style="cursor:pointer;"><div class="nc-k">Trip spend</div>'+
-    '<div class="nc-v'+(b.budget>0 && b.spent>b.budget?' neg':'')+'">'+inr(b.spent)+'<span class="muted" style="font-size:12px;font-weight:500;"> / '+inr(b.budget)+'</span></div>'+
+    '<div class="nc-v'+(b.budget>0 && b.spent>b.budget?' neg':'')+'">'+inrWhole(b.spent)+'<span class="muted" style="font-size:12px;font-weight:500;"> / '+inrWhole(b.budget)+'</span></div>'+
     barHtml(b.spent, b.budget)+'</div>';
 }
 
@@ -1158,15 +1159,15 @@ function viewBudgetCard(){
   var rows = CATEGORIES.filter(function(c){ return (Number(bud[c.id]) || 0) > 0 || b.byCat[c.id] > 0; }).map(function(c){
     var cb = Number(bud[c.id]) || 0, cs = b.byCat[c.id];
     return '<div class="bud-row"><div class="bud-top"><span>'+c.icon+' '+esc(c.label)+'</span>'+
-      '<span class="'+(cb > 0 && cs > cb ? 'neg' : 'muted')+'">'+inr(cs)+(cb > 0 ? ' / '+inr(cb) : ' · no budget')+'</span></div>'+
+      '<span class="'+(cb > 0 && cs > cb ? 'neg' : 'muted')+'">'+inrWhole(cs)+(cb > 0 ? ' / '+inrWhole(cb) : ' · no budget')+'</span></div>'+
       barHtml(cs, cb)+'</div>';
   }).join("");
   return '<div class="card bud-card">'+
     '<div class="bud-hero"><div><div class="now-hero-lbl">Trip budget</div>'+
-      '<div class="bud-big">'+inr(b.spent)+' <span class="muted" style="font-size:14px;font-weight:500;">of '+inr(b.budget)+'</span></div></div>'+
-      '<div class="bud-left '+(left < 0 ? 'neg' : 'pos')+'">'+(left < 0 ? inr(-left)+'<br><span>over</span>' : inr(left)+'<br><span>left</span>')+'</div></div>'+
+      '<div class="bud-big">'+inrWhole(b.spent)+' <span class="muted" style="font-size:14px;font-weight:500;">of '+inrWhole(b.budget)+'</span></div></div>'+
+      '<div class="bud-left '+(left < 0 ? 'neg' : 'pos')+'">'+(left < 0 ? inrWhole(-left)+'<br><span>over</span>' : inrWhole(left)+'<br><span>left</span>')+'</div></div>'+
     barHtml(b.spent, b.budget)+
-    '<div class="muted" style="font-size:12px;margin:8px 0 10px;">'+inr(b.spent / n)+' per person so far · your share '+inr(b.mine)+'</div>'+
+    '<div class="muted" style="font-size:12px;margin:8px 0 10px;">'+inrWhole(b.spent / n)+' per person so far · your share '+inrWhole(b.mine)+'</div>'+
     rows+
     '<button class="btn btn-ghost btn-sm" data-action="trip-settings" style="margin-top:10px;">Edit budget</button>'+
   '</div>';
@@ -1700,7 +1701,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
   }
   /** Formats an amount in the bill's own currency (what's being typed). */
   function cm(v){ return money(v, draftCurrency); }
-  var curChips = [["INR","₹ Rupees"],["LKR","රු LKR"]].map(function(c){
+  var curChips = [["INR","₹ Indian"],["LKR","Rs Sri Lankan"]].map(function(c){
     return '<div class="chip'+(draftCurrency===c[0]?" on":"")+'" data-role="cur" data-id="'+c[0]+'">'+c[1]+'</div>';
   }).join("");
 
@@ -1760,7 +1761,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
         '<div style="display:flex;gap:8px;align-items:center;">'+
           '<input type="text" class="split-input" data-role="item-desc" data-item="'+it.localId+'" style="flex:1;" maxlength="80" value="'+esc(it.desc)+'" placeholder="Item name">'+
           '<div class="amount-field" style="width:104px;"><span class="rupee cur-sym">'+curSymbol(draftCurrency)+'</span>'+
-            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:24px;" value="'+(it.amount||"")+'" placeholder="0"></div>'+
+            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:30px;" value="'+(it.amount||"")+'" placeholder="0"></div>'+
           '<button class="btn btn-line btn-sm" data-role="item-del" data-item="'+it.localId+'" style="padding:6px 9px;">✕</button>'+
         '</div>'+
         '<div class="chip-grid" style="margin-top:8px;">'+peopleChips+'</div>'+
