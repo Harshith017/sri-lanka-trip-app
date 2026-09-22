@@ -994,7 +994,8 @@ function viewBalances(){
 
 function viewBills(){
   if(!S.bills.length){
-    return '<div class="empty"><span class="big">🧾</span>No bills yet<br>Tap + to log the first one.</div>';
+    return '<button class="btn btn-brand btn-wide scan-cta" data-action="scan-bill">📷 Scan a bill</button>'+
+      '<div class="empty"><span class="big">🧾</span>No bills yet<br>Scan a receipt, or tap + to type one in.</div>';
   }
   var sorted = S.bills.slice().sort(function(a,b){
     return String(b.createdAt).localeCompare(String(a.createdAt));
@@ -1016,7 +1017,8 @@ function viewBills(){
       '<div class="bill-amt">'+inr(b.amount)+'</div></div>';
   }).join("");
   var total = S.bills.reduce(function(s,b){ return s+b.amount; }, 0);
-  return '<div class="section-label">All bills · '+inr(total)+' total</div><div class="card">'+rows+'</div>'+
+  return '<button class="btn btn-brand btn-wide scan-cta" data-action="scan-bill">📷 Scan a bill</button>'+
+    '<div class="section-label">All bills · '+inr(total)+' total</div><div class="card">'+rows+'</div>'+
          '<div class="muted" style="font-size:11.5px;padding:4px 2px;">Tap a bill to edit or delete it.</div>';
 }
 
@@ -1215,6 +1217,21 @@ function parseReceiptLines(rawText){
   return out;
 }
 
+/** First line that looks like a shop name (letters, no price) — usually the
+    restaurant/shop printed at the top of the receipt. */
+function guessReceiptTitle(rawText){
+  var ls = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/\s+/g," ").trim(); });
+  for(var i=0; i<Math.min(ls.length, 6); i++){
+    var l = ls[i];
+    if(l.length < 3 || l.length > 40) continue;
+    if(!/[a-z]{3,}/i.test(l)) continue;
+    if(/\d{3,}/.test(l)) continue;                       // phone numbers, prices
+    if(RECEIPT_HEADER_RE.test(l) || RECEIPT_SUMMARY_RE.test(l)) continue;
+    return cleanText(l.toLowerCase().replace(/\b\w/g, function(c){ return c.toUpperCase(); }), MAX_DESC_LEN);
+  }
+  return "";
+}
+
 /** Shrinks big phone photos (12MP+) to ~1600px and greyscales them before
     OCR — several times faster on a phone and usually more accurate. */
 function prepareReceiptImage(file){
@@ -1256,7 +1273,10 @@ function scanReceiptImage(file, btn){
     });
   }).then(function(result){
     if(btn){ btn.disabled = false; progress(label); }
-    return parseReceiptLines(result && result.data && result.data.text || "");
+    var text = result && result.data && result.data.text || "";
+    var lines = parseReceiptLines(text);
+    lines.title = guessReceiptTitle(text);
+    return lines;
   }).catch(function(err){
     if(btn){ btn.disabled = false; progress(label); }
     throw err;
@@ -1326,7 +1346,7 @@ function newDraftItem(desc, amount){
   return { localId:"it"+draftItemSeq, desc:desc||"", amount:amount||0, people:S.people.map(function(p){return p.email;}), mode:"equal", percents:{} };
 }
 
-function openBillSheet(existing, resumeDraft){
+function openBillSheet(existing, resumeDraft, autoScan){
   if(!S.people.length){ toast("Join the trip first", true); return; }
   if(!resumeDraft){
     draftSplit = existing ? existing.split.slice() : S.people.map(function(p){ return p.email; });
@@ -1413,6 +1433,7 @@ function openBillSheet(existing, resumeDraft){
 
   openSheetHtml(
     '<h3>'+(readOnly ? "Bill details" : (existing?"Edit bill":"Add a bill"))+'</h3>'+
+    (readOnly ? '' : '<button class="btn btn-brand btn-wide scan-cta" id="b-scan-top">📷 Scan bill — fills in items &amp; prices</button>')+
     (readOnly ? '<div class="day-tip" style="margin:-4px 0 12px;font-style:normal;">Added by '+esc(pName(existing.addedBy))+' — only they can change or delete it.</div>' : '')+
     '<div class="field"><label>What was it for</label>'+
       '<input type="text" id="b-desc" maxlength="80" placeholder="e.g. Dinner in Ella" value="'+esc(resumeDraft ? draftDesc : (existing ? existing.desc : ""))+'"></div>'+
@@ -1602,11 +1623,14 @@ function openBillSheet(existing, resumeDraft){
       var scanBtn = el.querySelector("#b-scan-receipt");
       var receiptInput = el.querySelector("#b-receipt-input");
       if(scanBtn) scanBtn.addEventListener("click", function(){ receiptInput.click(); });
+      var scanTop = el.querySelector("#b-scan-top");
+      if(scanTop) scanTop.addEventListener("click", function(){ receiptInput.click(); });
+      if(autoScan && receiptInput) receiptInput.click();
       if(receiptInput) receiptInput.addEventListener("change", function(){
         var file = receiptInput.files && receiptInput.files[0];
         if(!file) return;
         var sheetForScan = el;
-        scanReceiptImage(file, scanBtn).then(function(lines){
+        scanReceiptImage(file, (scanTop && scanTop.offsetParent) ? scanTop : scanBtn).then(function(lines){
           if(openSheetEl !== sheetForScan){ toast("Receipt scan discarded — that bill was closed"); return; }
           if(!lines.length){ toast("Couldn't read any prices — try a flat, well-lit photo, or add items by hand", true); return; }
           // The review sheet temporarily replaces this bill sheet (one sheet
@@ -1619,7 +1643,7 @@ function openBillSheet(existing, resumeDraft){
             // Drop blank placeholder rows so they don't block saving.
             draftItems = draftItems.filter(function(it){ return String(it.desc).trim() || Number(it.amount) > 0; });
             picked.forEach(function(p){ draftItems.push(newDraftItem(p.desc, p.amount)); });
-            if(!draftDesc.trim()) draftDesc = "Receipt";
+            if(!draftDesc.trim()) draftDesc = lines.title || "Receipt";
             openBillSheet(existingSnapshot, true);
             toast(picked.length+" item"+(picked.length===1?"":"s")+" added — now tap who had each one");
           }, function(){
@@ -1766,6 +1790,9 @@ document.addEventListener("click", function(e){
     var d = parseInt(t.dataset.day,10);
     openDay = (openDay===d) ? 0 : d;
     render();
+  }
+  else if(a==="scan-bill"){
+    openBillSheet(null, false, true);
   }
   else if(a==="edit-day"){
     var dayNum = parseInt(t.dataset.day,10);
