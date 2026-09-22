@@ -44,9 +44,10 @@ var SEED_ITINERARY = [
     items:[["Morning","Sightsee in Colombo"],["Afternoon","Departure flight to Bangalore"]], tip:"" }
 ];
 
-var DRIVE_LEGS = [["Airport → Kandy","~3–3.5h"],["Kandy → N'Eliya","~2.5–3h"],
-  ["N'Eliya → Ella","~2–2.5h"],["Ella → Mirissa","~3.5–4.5h"],
-  ["Mirissa → Galle","~1–1.5h"],["Galle → Colombo","~2–2.5h"]];
+// [route, duration, trip day it happens on]
+var DRIVE_LEGS = [["Airport → Kandy","~3–3.5h",1],["Kandy → N'Eliya","~2.5–3h",2],
+  ["N'Eliya → Ella","~2–2.5h",3],["Ella → Mirissa","~3.5–4.5h",5],
+  ["Mirissa → Galle","~1–1.5h",6],["Galle → Colombo","~2–2.5h",6]];
 
 var BUDGET_REF = [["Flights","₹28,000 / person"],["Food","₹1,300–1,500 / day"],
   ["Car rental","₹45,000 total"],["Petrol","₹8,500 total"],["Stays","~₹34,300 total"]];
@@ -105,6 +106,7 @@ var syncState = "ok";
 var unsubPeople = null, unsubBills = null, unsubSettlements = null, unsubItinerary = null;
 var latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
 var itinerarySeeded = false;
+var joinShown = false;
 
 /* ====================== Helpers ====================== */
 
@@ -165,67 +167,91 @@ function toast(msg, bad){
 
 /* ====================== Balance engine ====================== */
 
-/** Returns { email: amountOwedForThisBill } for one bill, honoring its split mode. */
-/** For itemized bills: sums each line item's per-person share across all
-    items. Each item is { desc, amount, people:[email,...], mode:"equal"|"percent", percents:{email:pct} }. */
-function itemizedShares(bill){
-  var shares = {};
-  (bill.items||[]).forEach(function(item){
-    var people = item.people||[];
-    if(!people.length) return;
-    if(item.mode === "percent" && item.percents){
-      people.forEach(function(e){
-        var pct = Number(item.percents[e])||0;
-        shares[e] = round2((shares[e]||0) + item.amount*(pct/100));
-      });
-    } else {
-      var share = round2(item.amount / people.length);
-      people.forEach(function(e){ shares[e] = round2((shares[e]||0) + share); });
-    }
+/** Splits `amount` (rupees) across people in proportion to `weights`
+    ({email: weight}), working in whole paise with the largest-remainder
+    method so the parts ALWAYS add up to exactly `amount` — no ₹0.01 drift,
+    no phantom "pay ₹0.01" settlements. A weight of 0 means that person
+    pays nothing. Ties go to the alphabetically-first email so every device
+    computes identical results. Returns { email: paise }. */
+function allocatePaise(amount, weights){
+  var totalPaise = Math.round(Number(amount)*100);
+  var emails = Object.keys(weights).filter(function(e){ return (Number(weights[e])||0) > 0; }).sort();
+  var out = {};
+  Object.keys(weights).forEach(function(e){ out[e] = 0; });
+  var totalW = emails.reduce(function(s,e){ return s + Number(weights[e]); }, 0);
+  if(!emails.length || totalW <= 0 || !isFinite(totalPaise)) return out;
+  var assigned = 0, rema = [];
+  emails.forEach(function(e){
+    var exact = totalPaise * Number(weights[e]) / totalW;
+    var fl = Math.floor(exact);
+    out[e] = fl; assigned += fl;
+    rema.push({ e:e, r: exact - fl });
   });
-  return shares;
+  rema.sort(function(a,b){ return (b.r - a.r) || (a.e < b.e ? -1 : a.e > b.e ? 1 : 0); });
+  for(var i=0; assigned < totalPaise; i = (i+1) % rema.length){ out[rema[i].e]++; assigned++; }
+  return out;
 }
 
-function billShares(b){
-  var shares = {};
+/** Per-person paise owed for one bill, honoring its split mode. */
+function billSharesPaise(b){
+  var people = b.split || [];
+  var w = {};
   if(b.splitMode === "itemized" && Array.isArray(b.items)){
-    return itemizedShares(b);
-  } else if(b.splitMode === "exact" && b.splitAmounts){
-    b.split.forEach(function(e){ shares[e] = round2(Number(b.splitAmounts[e])||0); });
-  } else if(b.splitMode === "shares" && b.splitShares){
-    var totalW = 0;
-    b.split.forEach(function(e){ totalW += Number(b.splitShares[e])||0; });
-    if(totalW <= 0) totalW = b.split.length;
-    b.split.forEach(function(e){
-      var w = (b.splitShares && Number(b.splitShares[e])) || 1;
-      shares[e] = round2(b.amount * (w/totalW));
+    var sum = {};
+    b.items.forEach(function(item){
+      var ip = item.people || [];
+      if(!ip.length) return;
+      var iw = {}, anyPct = false;
+      ip.forEach(function(e){
+        iw[e] = (item.mode === "percent" && item.percents) ? Math.max(0, Number(item.percents[e])||0) : 1;
+        if(iw[e] > 0) anyPct = true;
+      });
+      if(!anyPct) ip.forEach(function(e){ iw[e] = 1; });
+      var part = allocatePaise(round2(item.amount), iw);
+      Object.keys(part).forEach(function(e){ sum[e] = (sum[e]||0) + part[e]; });
     });
-  } else {
-    var share = round2(b.amount / b.split.length);
-    b.split.forEach(function(e){ shares[e] = share; });
+    return sum;
   }
-  return shares;
+  if(b.splitMode === "exact" && b.splitAmounts){
+    // Exact amounts are validated to within ₹0.02 of the total; use them as
+    // weights so any tiny rounding gap is absorbed and totals match exactly.
+    people.forEach(function(e){ w[e] = Math.max(0, Number(b.splitAmounts[e])||0); });
+    var anyExact = people.some(function(e){ return w[e] > 0; });
+    if(anyExact) return allocatePaise(b.amount, w);
+  } else if(b.splitMode === "shares" && b.splitShares){
+    people.forEach(function(e){ w[e] = Math.max(0, Number(b.splitShares[e])||0); });
+    var anyShare = people.some(function(e){ return w[e] > 0; });
+    if(anyShare) return allocatePaise(b.amount, w);
+  }
+  w = {}; people.forEach(function(e){ w[e] = 1; });
+  return allocatePaise(b.amount, w);
 }
 
+/** Same as billSharesPaise but in rupees, for display. */
+function billShares(b){
+  var p = billSharesPaise(b), out = {};
+  Object.keys(p).forEach(function(e){ out[e] = p[e]/100; });
+  return out;
+}
+
+/** Balances computed in integer paise (exact), returned in rupees. */
 function computeBalances(){
   var bal = {};
   S.people.forEach(function(p){ bal[p.email] = 0; });
+  function add(e, paise){ bal[e] = (bal[e]||0) + paise; }
   S.bills.forEach(function(b){
-    if(bal[b.paidBy] === undefined) bal[b.paidBy] = 0;
-    bal[b.paidBy] = round2(bal[b.paidBy] + b.amount);
-    var shares = billShares(b);
-    b.split.forEach(function(e){
-      if(bal[e] === undefined) bal[e] = 0;
-      bal[e] = round2(bal[e] - (shares[e]||0));
-    });
+    var shares = billSharesPaise(b), allocated = 0;
+    Object.keys(shares).forEach(function(e){ add(e, -shares[e]); allocated += shares[e]; });
+    add(b.paidBy, allocated);   // equals the bill amount for any valid bill
   });
   S.settlements.forEach(function(s){
-    if(bal[s.from] === undefined) bal[s.from] = 0;
-    if(bal[s.to] === undefined) bal[s.to] = 0;
-    bal[s.from] = round2(bal[s.from] + s.amount);
-    bal[s.to]   = round2(bal[s.to]   - s.amount);
+    var p = Math.round(s.amount*100);
+    add(s.from, p);
+    add(s.to, -p);
   });
-  return bal;
+  var out = {};
+  Object.keys(bal).forEach(function(e){ out[e] = bal[e]/100; });
+  return out;
 }
 
 function computeSettlements(bal){
@@ -326,6 +352,7 @@ function validateBill(payload, peopleEmails){
       if(!isFinite(v) || v<0) v = 0;
       amts[e] = v; sum = round2(sum+v);
     });
+    if(sum <= 0) throw new Error("Enter how much each person owes.");
     if(Math.abs(sum-amount) > 0.02) throw new Error("The exact amounts (" + inr(sum) + ") need to add up to the bill total (" + inr(amount) + ").");
     out.splitAmounts = amts;
   } else if(splitMode === "shares"){
@@ -455,7 +482,8 @@ function rebuildState(){
     // Nobody has synced the itinerary yet — fall back to the built-in seed
     // data so the app still works, and seed Firestore once so edits persist.
     itinerary = SEED_ITINERARY.slice();
-    seedItineraryOnce();
+    // Only members may write it, so wait until this person has joined.
+    if(people.some(function(p){ return p.email === S.me; })) seedItineraryOnce();
   } else {
     itinerarySnap.forEach(function(doc){
       var d = doc.data();
@@ -484,9 +512,18 @@ function rebuildState(){
 
   setSync("ok");
   if(!booted){
-    if(!joined){ showJoinScreen(); return; }
+    if(!joined){
+      // Only draw the join form once — later snapshots (other people adding
+      // bills) must not wipe what this person is typing.
+      if(!joinShown){ joinShown = true; showJoinScreen(); }
+      return;
+    }
     booted = true;
     buildShell();
+    if(!passkeyOffered){
+      passkeyOffered = true;
+      setTimeout(function(){ if(booted && !openSheetEl) offerPasskeySetup(S.me); }, 900);
+    }
   }
   render();
 }
@@ -516,10 +553,14 @@ function seedItineraryOnce(){
       title: d.title, items: itemsToFirestore(d.items), tip: d.tip||""
     }, { merge:true });
   });
-  batch.commit().catch(function(err){ console.warn("Itinerary seed failed:", err); });
+  batch.commit().catch(function(err){
+    console.warn("Itinerary seed failed, will retry:", err && err.code);
+    itinerarySeeded = false;   // try again on the next snapshot (e.g. after joining)
+  });
 }
 
 function startListeners(){
+  if(unsubPeople) return;   // already listening
   unsubPeople = db.collection("people").onSnapshot(function(snap){
     latestSnapshots.people = snap;
     rebuildState();
@@ -556,35 +597,60 @@ function serverFail(err){
   }
 }
 
-/** Run a write against Firestore, show a toast, and close any open sheet.
-    Offline-aware: if the browser is offline, Firestore queues the write
-    locally (thanks to enablePersistence) and this promise won't resolve
-    until reconnect — so we close the sheet and show "queued" immediately
-    rather than looking stuck. */
+/** Turns Firestore error codes into something a person can act on. */
+function friendlyError(err){
+  var code = err && err.code;
+  if(code === "permission-denied") return "You don't have permission to change that — only the person who added it can.";
+  if(code === "unavailable") return "Can't reach the server — your change is saved on this phone and will sync.";
+  return (err && err.message) ? err.message : "Something went wrong — try again.";
+}
+
+/** Run a write, close the sheet, and toast.
+    Firestore applies writes locally straight away and the rest of the app
+    re-renders from that, but the promise only settles once the SERVER
+    confirms — on hill-country signal that can take ages even while the phone
+    claims to be online. So: if the server hasn't answered in 1.2s, close the
+    sheet anyway and say it'll sync. Validation mistakes reject instantly, so
+    those keep the sheet open for fixing. Only closes the sheet this write
+    came from, never one the person opened afterwards. */
 function writeOp(promise, okMsg, btn){
+  var sheetAtStart = openSheetEl;
+  var settled = false, deferred = false;
   if(btn) btn.disabled = true;
   setSync("busy");
   pendingWrites++;
   updateOfflineBanner();
 
-  if(isOffline){
-    closeSheet();
+  function closeOwnSheet(){ if(sheetAtStart && openSheetEl === sheetAtStart) closeSheet(); }
+
+  var timer = setTimeout(function(){
+    if(settled) return;
+    deferred = true;
     if(btn) btn.disabled = false;
-    toast((okMsg||"Saved") + " · queued offline");
-  }
+    closeOwnSheet();
+    toast((okMsg || "Saved") + " · will sync when signal is back");
+  }, 1200);
 
   promise.then(function(){
+    settled = true; clearTimeout(timer);
     if(btn) btn.disabled = false;
     pendingWrites = Math.max(0, pendingWrites-1);
-    closeSheet();
-    setSync("ok");
-    if(!isOffline && okMsg) toast(okMsg);
+    setSync(pendingWrites > 0 ? "busy" : "ok");
     updateOfflineBanner();
-  }).catch(function(err){
+    if(!deferred){ closeOwnSheet(); if(okMsg) toast(okMsg); }
+    else if(pendingWrites === 0) toast("All changes synced ✓");
+  }, function(err){
+    settled = true; clearTimeout(timer);
     if(btn) btn.disabled = false;
     pendingWrites = Math.max(0, pendingWrites-1);
     updateOfflineBanner();
-    serverFail(err);
+    if(err && err.code){           // came back from Firestore
+      setSync("err");
+      toast(friendlyError(err), true);
+    } else {                       // our own validation message
+      setSync("ok");
+      toast(err && err.message ? err.message : "Check the details and try again", true);
+    }
   });
 }
 
@@ -608,7 +674,14 @@ function joinTrip(name, upi){
   }, { merge:true });
 }
 
-function updateProfile(name, upi){ return joinTrip(name, upi); }
+/** Edits name/UPI only — leaves joinedAt alone so the member order is stable. */
+function updateProfile(name, upi){
+  var cleanName = cleanText(name, MAX_NAME_LEN);
+  if(!cleanName) return Promise.reject(new Error("Name can't be empty."));
+  return db.collection("people").doc(docId(S.me)).set({
+    name: cleanName, upi: cleanText(upi, MAX_UPI_LEN), photo: S.myPhoto || ""
+  }, { merge:true });
+}
 
 function addBill(payload){
   try{
@@ -694,6 +767,7 @@ function updateItinerary(day, payload){
       return [cleanText(it[0],20), cleanText(it[1], MAX_ITEM_LEN)];
     }).filter(function(it){ return it[1]; });
     if(!title) throw new Error("Give this day a title.");
+    if(items.length > 30) throw new Error("That's a lot for one day — keep it to 30 items or fewer.");
     return db.collection("itinerary").doc("day"+day).set({
       day: day, title: title, stay: stay, tip: tip, items: itemsToFirestore(items),
       updatedBy: S.me, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
@@ -737,7 +811,8 @@ function buildShell(){
 
   // Keep the "Now" view fresh even if nobody touches the app — re-render
   // every minute so "up next" and the countdown stay accurate.
-  setInterval(function(){ if(activeTab==="now") render(); }, 60000);
+  if(nowTimer) clearInterval(nowTimer);
+  nowTimer = setInterval(function(){ if(booted && activeTab==="now") render(); }, 60000);
 }
 
 function setTab(tab){
@@ -796,7 +871,7 @@ function viewNow(){
       '</div>'+
       '<div class="section-label">First up</div>'+
       '<div class="card">'+days[0].items.slice(0,4).map(function(it){
-        return '<div class="item-row"><div class="item-time">'+esc(it[0])+'</div><div class="item-text">'+esc(it[1])+'</div></div>';
+        return '<div class="item-row"><div class="item-time">'+esc(it[0])+'</div><div class="item-text">'+esc(it[1])+'</div>'+mapsBtnHtml(it[1])+'</div>';
       }).join("")+'</div>';
   }
 
@@ -833,10 +908,14 @@ function viewNow(){
     ? '<div class="now-hero-lbl">Up next</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(nextItem.it[1])+mapsBtnHtml(nextItem.it[1],"margin-left:6px;")+'</div><div class="now-hero-time">'+esc(nextItem.it[0])+'</div>'
     : '<div class="now-hero-lbl">Today</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(d.title)+'</div>';
 
-  var legIdx = d.day - 1; // DRIVE_LEGS[i] connects day i to day i+1
-  var legChip = (legIdx>=0 && legIdx<DRIVE_LEGS.length)
-    ? '<div class="now-chip"><div class="nc-k">Next drive</div><div class="nc-v">'+esc(DRIVE_LEGS[legIdx][1])+'</div></div>'
-    : '';
+  var todaysLegs = DRIVE_LEGS.filter(function(l){ return l[2] === d.day; });
+  var nextLeg = DRIVE_LEGS.filter(function(l){ return l[2] > d.day; })[0];
+  var legChip = todaysLegs.length
+    ? '<div class="now-chip"><div class="nc-k">Today\'s drive</div><div class="nc-v" style="font-size:13.5px;">'+
+        todaysLegs.map(function(l){ return esc(l[0])+' · '+esc(l[1]); }).join('<br>')+'</div></div>'
+    : (nextLeg
+      ? '<div class="now-chip"><div class="nc-k">No driving today · next (Day '+nextLeg[2]+')</div><div class="nc-v" style="font-size:13.5px;">'+esc(nextLeg[0])+' · '+esc(nextLeg[1])+'</div></div>'
+      : '');
 
   var restOfDay = itemsWithTime.map(function(x, i){
     var done = x.t && x.t <= now;
@@ -985,9 +1064,11 @@ function viewSettle(){
 /* ====================== Sheets ====================== */
 
 var openSheetEl = null;
+var sheetOnDismiss = null;   // called only when the person taps outside to dismiss
 var scrim = document.getElementById("scrim");
 
 function closeSheet(){
+  sheetOnDismiss = null;
   if(!openSheetEl) return;
   var el = openSheetEl;
   el.classList.remove("show");
@@ -995,15 +1076,20 @@ function closeSheet(){
   openSheetEl = null;
   setTimeout(function(){ if(el.parentNode) el.parentNode.removeChild(el); }, 220);
 }
-scrim.addEventListener("click", closeSheet);
+scrim.addEventListener("click", function(){
+  var cb = sheetOnDismiss;
+  closeSheet();
+  if(cb) cb();
+});
 
-function openSheetHtml(html, onMount){
+function openSheetHtml(html, onMount, onDismiss){
   closeSheet();
   var el = document.createElement("div");
   el.className = "sheet";
   el.innerHTML = '<div class="sheet-handle"></div>' + html;
   document.body.appendChild(el);
   openSheetEl = el;
+  sheetOnDismiss = onDismiss || null;
   scrim.classList.add("show");
   requestAnimationFrame(function(){ el.classList.add("show"); });
   if(onMount) onMount(el);
@@ -1042,6 +1128,10 @@ function openProfileSheet(){
     '<div class="join-email">'+(S.myPhoto?'<img src="'+esc(S.myPhoto)+'" alt="">':'')+'<span>'+esc(S.me)+'</span></div>'+
     '<div class="field"><label>Name</label><input type="text" id="p-name" maxlength="40" value="'+esc(me.name)+'"></div>'+
     '<div class="field"><label>UPI ID</label><input type="text" id="p-upi" maxlength="60" placeholder="name@bank" value="'+esc(me.upi)+'"></div>'+
+    (passkeySupported()
+      ? '<div class="field"><label>Face ID lock on this device</label>'+
+          '<button class="btn btn-line btn-sm" id="p-faceid">'+(passkeyFor(S.me) ? "Turn off Face ID lock" : "Turn on Face ID lock")+'</button></div>'
+      : '')+
     '<div class="sheet-actions"><button class="btn btn-brand" id="p-save">Save</button>'+
     '<button class="btn btn-ghost" id="p-signout">Sign out</button></div>',
     function(el){
@@ -1050,11 +1140,31 @@ function openProfileSheet(){
         if(!name){ toast("Name can't be empty", true); return; }
         writeOp(updateProfile(name, el.querySelector("#p-upi").value.trim()), "Saved", this);
       });
+      var fid = el.querySelector("#p-faceid");
+      if(fid) fid.addEventListener("click", function(){
+        if(passkeyFor(S.me)){
+          setStoredPasskey(null);
+          lsSet("pw_passkey_dismissed", S.me);
+          fid.textContent = "Turn on Face ID lock";
+          toast("Face ID lock turned off");
+        } else {
+          fid.disabled = true;
+          registerPasskey(S.me).then(function(){
+            markUnlocked(S.me);
+            lsSet("pw_passkey_dismissed", null);
+            fid.disabled = false;
+            fid.textContent = "Turn off Face ID lock";
+            toast("Face ID lock is on for this device");
+          }).catch(function(err){
+            fid.disabled = false;
+            if(!(err && err.name==="NotAllowedError")) toast(err && err.message ? err.message : "Couldn't set that up", true);
+          });
+        }
+      });
       el.querySelector("#p-signout").addEventListener("click", function(){
-        setStoredPasskey(null);
+        closeSheet();
         auth.signOut();
       });
-      el.querySelector("#p-name").focus();
     }
   );
 }
@@ -1075,79 +1185,131 @@ function loadTesseract(){
   return tesseractLoadPromise;
 }
 
-/** Parses raw OCR text into candidate {desc, amount} lines: any line that
-    ends with (or contains) a plausible price gets its number pulled out,
-    the rest kept as the item description. Pure on-device heuristic, no AI —
-    the person reviews and picks which lines are real items next. */
+/** Lines that summarise the bill rather than being something someone ate or
+    bought. Shown in the review list but NOT pre-selected, otherwise the
+    total gets added as an extra "item" and the bill doubles. */
+var RECEIPT_SUMMARY_RE = /\b(sub\s*-?\s*total|total|grand|net\s*amount|amount\s*due|balance|cash|change|tender(ed)?|paid|card|visa|master|amex|upi|round(ing)?\s*off)\b/i;
+
+/** Header/footer lines with a number at the end (table no., phone, bill no.)
+    — shown unticked, not dropped, since "Table water 150" is a real item. */
+var RECEIPT_HEADER_RE = /^(table|tbl|tel|phone|ph|date|time|bill\s*no|invoice|inv|order|receipt|guest|pax|covers?|cashier|server|waiter|steward|token|kot|gst|vat\s*reg)\b(?!\s*water)/i;
+
+/** Parses raw OCR text into candidate {desc, amount} lines: any line ending in
+    a plausible price. Handles 1200, 1,200, 1,200.00 and 1200.50 (the old
+    pattern read "1200" as 200). Pure on-device heuristic — the person
+    confirms in the review step. */
 function parseReceiptLines(rawText){
-  var lines = String(rawText||"").split(/\r?\n/).map(function(l){ return l.trim(); }).filter(function(l){ return l.length>1; });
-  var priceRe = /(?:₹|rs\.?|inr)?\s*([0-9]{1,3}(?:[,.][0-9]{3})*(?:\.[0-9]{1,2})?|[0-9]+\.[0-9]{2})\s*$/i;
+  var lines = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/\s+/g," ").trim(); }).filter(function(l){ return l.length>1; });
+  var priceRe = /(?:₹|rs\.?|lkr|inr)?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s*$/i;
   var out = [];
   lines.forEach(function(line){
     var m = priceRe.exec(line);
     if(!m) return;
-    var numStr = m[1].replace(/,/g,"");
-    var amount = round2(parseFloat(numStr));
+    var amount = round2(parseFloat(m[1].replace(/,/g,"")));
     if(!isFinite(amount) || amount<=0 || amount>MAX_AMOUNT) return;
-    var desc = cleanText(line.slice(0, m.index), MAX_DESC_LEN);
-    if(!desc) desc = "Item";
-    // Skip obvious non-item lines (totals/tax/change are still useful to see, so keep them —
-    // the person filters in the review step, we don't guess here).
-    out.push({ desc:desc, amount:amount, raw:line });
+    var desc = cleanText(line.slice(0, m.index).replace(/(₹|rs\.?|lkr|inr)\s*$/i,""), MAX_DESC_LEN);
+    if(!desc || !/[a-z]/i.test(desc)) return;           // bare numbers: dates, phone, table no.
+    if(/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}:\d{2}\s*$/.test(desc)) return; // "Date 20/11/2026 21:14"
+    out.push({ desc:desc, amount:amount, summary: RECEIPT_SUMMARY_RE.test(desc) || RECEIPT_HEADER_RE.test(desc) });
   });
   return out;
 }
 
+/** Shrinks big phone photos (12MP+) to ~1600px and greyscales them before
+    OCR — several times faster on a phone and usually more accurate. */
+function prepareReceiptImage(file){
+  return new Promise(function(resolve){
+    var url = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function(){
+      try{
+        var max = 1600, w = img.naturalWidth, h = img.naturalHeight;
+        var k = Math.min(1, max / Math.max(w, h));
+        var c = document.createElement("canvas");
+        c.width = Math.round(w*k); c.height = Math.round(h*k);
+        var ctx = c.getContext("2d");
+        ctx.filter = "grayscale(1) contrast(1.25)";
+        ctx.drawImage(img, 0, 0, c.width, c.height);
+        URL.revokeObjectURL(url);
+        resolve(c);
+      } catch(e){ URL.revokeObjectURL(url); resolve(file); }
+    };
+    img.onerror = function(){ URL.revokeObjectURL(url); resolve(file); };
+    img.src = url;
+  });
+}
+
 function scanReceiptImage(file, btn){
+  var label = btn ? btn.textContent : "";
+  function progress(txt){ if(btn) btn.textContent = txt; }
   if(btn) btn.disabled = true;
-  toast("Reading receipt…");
+  progress("Loading scanner…");
   return loadTesseract().then(function(){
-    return Tesseract.recognize(file, "eng");
+    progress("Preparing photo…");
+    return prepareReceiptImage(file);
+  }).then(function(img){
+    return Tesseract.recognize(img, "eng", {
+      logger: function(m){
+        if(m && m.status === "recognizing text") progress("Reading… " + Math.round((m.progress||0)*100) + "%");
+        else if(m && /load/i.test(m.status||"")) progress("Loading scanner…");
+      }
+    });
   }).then(function(result){
-    if(btn) btn.disabled = false;
-    var text = result && result.data && result.data.text || "";
-    return parseReceiptLines(text);
+    if(btn){ btn.disabled = false; progress(label); }
+    return parseReceiptLines(result && result.data && result.data.text || "");
   }).catch(function(err){
-    if(btn) btn.disabled = false;
+    if(btn){ btn.disabled = false; progress(label); }
     throw err;
   });
 }
 
-function openReceiptReviewSheet(candidates, onConfirm){
-  var picked = candidates.map(function(){ return true; }); // default: all selected
+function openReceiptReviewSheet(candidates, onConfirm, onBack){
+  var picked = candidates.map(function(c){ return !c.summary; });
 
   function renderList(){
     return candidates.map(function(c, i){
-      return '<div class="split-row" data-role="cand-row" data-idx="'+i+'">'+
-        '<div class="chip'+(picked[i]?" on":"")+'" data-role="cand-toggle" data-idx="'+i+'" style="flex:1;text-align:left;display:flex;justify-content:space-between;">'+
-          '<span>'+esc(c.desc)+'</span><span style="margin-left:8px;">'+inr(c.amount)+'</span></div>'+
+      return '<div class="split-row">'+
+        '<div class="chip'+(picked[i]?" on":"")+'" data-role="cand-toggle" data-idx="'+i+'" style="flex:1;text-align:left;display:flex;justify-content:space-between;gap:8px;">'+
+          '<span>'+esc(c.desc)+(c.summary?' <span class="muted" style="font-weight:500;">· total line</span>':'')+'</span>'+
+          '<span>'+inr(c.amount)+'</span></div>'+
       '</div>';
     }).join("");
   }
+  function pickedSum(){ return candidates.reduce(function(s,c,i){ return s + (picked[i]?c.amount:0); }, 0); }
 
   openSheetHtml(
     '<h3>Receipt scanned</h3>'+
-    '<p class="muted" style="font-size:13px;line-height:1.5;margin-top:-8px;">Tap to keep or remove lines — this is on-device text recognition, so double-check the amounts before saving.</p>'+
+    '<p class="muted" style="font-size:13px;line-height:1.5;margin-top:-8px;">Tap lines to keep or drop them. Total/cash/change lines start unticked so nothing is counted twice. Check amounts against the paper receipt.</p>'+
     '<div id="cand-list">'+renderList()+'</div>'+
-    '<div class="sheet-actions"><button class="btn btn-brand" id="cand-add">Add selected items</button></div>',
+    '<div class="split-hint" id="cand-sum"></div>'+
+    '<div class="sheet-actions">'+
+      '<button class="btn btn-ghost" id="cand-back">Back</button>'+
+      '<button class="btn btn-brand" id="cand-add">Add selected</button>'+
+    '</div>',
     function(el){
-      function rerender(){ el.querySelector("#cand-list").innerHTML = renderList(); wire(); }
+      function refresh(){
+        el.querySelector("#cand-list").innerHTML = renderList();
+        el.querySelector("#cand-sum").textContent = "Selected: " + inr(pickedSum());
+        wire();
+      }
       function wire(){
         el.querySelectorAll('[data-role="cand-toggle"]').forEach(function(c){
           c.addEventListener("click", function(){
             var i = parseInt(c.dataset.idx,10);
             picked[i] = !picked[i];
-            rerender();
+            refresh();
           });
         });
       }
-      wire();
+      refresh();
+      el.querySelector("#cand-back").addEventListener("click", function(){ closeSheet(); if(onBack) onBack(); });
       el.querySelector("#cand-add").addEventListener("click", function(){
         var chosen = candidates.filter(function(c,i){ return picked[i]; });
         closeSheet();
         onConfirm(chosen);
       });
-    }
+    },
+    onBack   // tapping outside the sheet also goes back to the bill, not into the void
   );
 }
 
@@ -1157,6 +1319,7 @@ var draftSplit = [], draftPaidBy = "", draftCat = "other", draftMode = "equal";
 var draftAmounts = {}, draftShares = {};
 var draftItems = []; // itemized mode: [{ localId, desc, amount, people:[email], mode:"equal"|"percent", percents:{} }]
 var draftItemSeq = 0;
+var draftDesc = "";
 
 function newDraftItem(desc, amount){
   draftItemSeq++;
@@ -1196,6 +1359,9 @@ function openBillSheet(existing, resumeDraft){
       }).join("")+'</div><div class="split-hint" id="b-hint"></div>';
     }
     // exact or shares: a per-person row with an input, checkbox baked into inclusion
+    if(draftMode === "shares"){
+      draftSplit.forEach(function(e){ if(draftShares[e] == null || draftShares[e] === "") draftShares[e] = 1; });
+    }
     var rows = S.people.map(function(p){
       var included = draftSplit.indexOf(p.email) >= 0;
       var val = draftMode==="exact" ? (draftAmounts[p.email]!=null?draftAmounts[p.email]:"") : (draftShares[p.email]!=null?draftShares[p.email]:(included?1:""));
@@ -1239,14 +1405,18 @@ function openBillSheet(existing, resumeDraft){
         '<div style="margin-top:8px;">'+modeToggle+'</div>'+
         percentRow+
       '</div>';
-    }).join("") + '<div class="split-hint" style="margin-top:4px;">Items total: '+inr(itemTotal())+'</div>';
+    }).join("") + '<div class="split-hint" id="b-items-total" style="margin-top:4px;">Items total: '+inr(itemTotal())+'</div>';
   }
 
+  // Firestore rules only let the person who added a bill change or delete it.
+  var readOnly = !!(existing && existing.addedBy && existing.addedBy !== S.me);
+
   openSheetHtml(
-    '<h3>'+(existing?"Edit bill":"Add a bill")+'</h3>'+
+    '<h3>'+(readOnly ? "Bill details" : (existing?"Edit bill":"Add a bill"))+'</h3>'+
+    (readOnly ? '<div class="day-tip" style="margin:-4px 0 12px;font-style:normal;">Added by '+esc(pName(existing.addedBy))+' — only they can change or delete it.</div>' : '')+
     '<div class="field"><label>What was it for</label>'+
-      '<input type="text" id="b-desc" maxlength="80" placeholder="e.g. Dinner in Ella" value="'+(existing?esc(existing.desc):"")+'"></div>'+
-    '<div class="field" id="b-amount-field"><label>Amount</label><div class="amount-field"><span class="rupee">₹</span>'+
+      '<input type="text" id="b-desc" maxlength="80" placeholder="e.g. Dinner in Ella" value="'+esc(resumeDraft ? draftDesc : (existing ? existing.desc : ""))+'"></div>'+
+    '<div class="field" id="b-amount-field" style="display:'+(draftMode==="itemized"?"none":"block")+';"><label>Amount</label><div class="amount-field"><span class="rupee">₹</span>'+
       '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+(existing?existing.amount:"")+'"></div></div>'+
     '<div class="field"><label>Category</label><div class="chip-grid">'+catChips+'</div></div>'+
     '<div class="field"><label>Who paid</label><div class="chip-grid">'+payChips+'</div></div>'+
@@ -1257,14 +1427,16 @@ function openBillSheet(existing, resumeDraft){
           '<button class="btn btn-ghost btn-sm" id="b-scan-receipt">📷 Scan receipt</button>'+
           '<button class="btn btn-ghost btn-sm" id="b-add-item">+ Add item</button>'+
         '</div>'+
-        '<input type="file" id="b-receipt-input" accept="image/*" capture="environment" style="display:none;">'+
+        '<input type="file" id="b-receipt-input" accept="image/*" style="display:none;">'+
         '<div id="b-items-list">'+renderItemsSection()+'</div>'+
       '</div>'+
     '</div>'+
-    '<div class="sheet-actions">'+
-      (existing?'<button class="btn btn-line" id="b-del">Delete</button>':'')+
-      '<button class="btn btn-brand" id="b-save">'+(existing?"Save changes":"Save bill")+'</button>'+
-    '</div>',
+    (readOnly
+      ? '<div class="sheet-actions"><button class="btn btn-ghost" id="b-close">Close</button></div>'
+      : '<div class="sheet-actions">'+
+          (existing?'<button class="btn btn-line" id="b-del">Delete</button>':'')+
+          '<button class="btn btn-brand" id="b-save">'+(existing?"Save changes":"Save bill")+'</button>'+
+        '</div>'),
     function(el){
       function amt(){ return parseFloat(el.querySelector("#b-amount").value) || 0; }
 
@@ -1311,7 +1483,7 @@ function openBillSheet(existing, resumeDraft){
           inp.addEventListener("input", function(){
             var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
             if(it) it.amount = parseFloat(inp.value)||0;
-            var totalEl = el.querySelector("#b-items-list .split-hint:last-child");
+            var totalEl = el.querySelector("#b-items-total");
             if(totalEl) totalEl.textContent = "Items total: "+inr(itemTotal());
           });
         });
@@ -1340,7 +1512,13 @@ function openBillSheet(existing, resumeDraft){
         el.querySelectorAll('[data-role="item-percent"]').forEach(function(inp){
           inp.addEventListener("input", function(){
             var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
-            if(it) it.percents[inp.dataset.id] = parseFloat(inp.value)||0;
+            if(!it) return;
+            it.percents[inp.dataset.id] = parseFloat(inp.value)||0;
+            var sumPct = 0; it.people.forEach(function(e){ sumPct += Number(it.percents[e])||0; });
+            var hintEl = el.querySelector('[data-item-card="'+it.localId+'"] .split-hint');
+            if(hintEl){
+              hintEl.textContent = Math.round(sumPct*100)/100 + '% of ' + inr(it.amount) + (Math.abs(sumPct-100) <= 0.5 ? " ✓" : " — needs to total 100%");
+            }
           });
         });
         el.querySelectorAll('[data-role="item-del"]').forEach(function(btn){
@@ -1427,17 +1605,25 @@ function openBillSheet(existing, resumeDraft){
       if(receiptInput) receiptInput.addEventListener("change", function(){
         var file = receiptInput.files && receiptInput.files[0];
         if(!file) return;
+        var sheetForScan = el;
         scanReceiptImage(file, scanBtn).then(function(lines){
-          if(!lines.length){ toast("Couldn't find any text in that photo", true); return; }
-          // The review sheet replaces this bill sheet (only one sheet can be
-          // open at a time); reopen the bill sheet with the picked items
-          // merged in once the person confirms, so nothing is lost.
+          if(openSheetEl !== sheetForScan){ toast("Receipt scan discarded — that bill was closed"); return; }
+          if(!lines.length){ toast("Couldn't read any prices — try a flat, well-lit photo, or add items by hand", true); return; }
+          // The review sheet temporarily replaces this bill sheet (one sheet
+          // at a time). Remember what's been typed so far, then reopen the
+          // bill sheet with it intact — whether they add items or go back.
+          draftDesc = el.querySelector("#b-desc").value;
+          draftMode = "itemized";
           var existingSnapshot = existing;
           openReceiptReviewSheet(lines, function(picked){
+            // Drop blank placeholder rows so they don't block saving.
+            draftItems = draftItems.filter(function(it){ return String(it.desc).trim() || Number(it.amount) > 0; });
             picked.forEach(function(p){ draftItems.push(newDraftItem(p.desc, p.amount)); });
-            draftMode = "itemized";
+            if(!draftDesc.trim()) draftDesc = "Receipt";
             openBillSheet(existingSnapshot, true);
-            toast(picked.length+" item"+(picked.length===1?"":"s")+" added from receipt");
+            toast(picked.length+" item"+(picked.length===1?"":"s")+" added — now tap who had each one");
+          }, function(){
+            openBillSheet(existingSnapshot, true);
           });
         }).catch(function(err){
           toast("Couldn't read that receipt: "+(err&&err.message?err.message:"try again"), true);
@@ -1445,6 +1631,17 @@ function openBillSheet(existing, resumeDraft){
           receiptInput.value = "";
         });
       });
+
+      if(readOnly){
+        el.querySelectorAll("input, .chip, .btn").forEach(function(x){
+          if(x.id === "b-close") return;
+          x.style.pointerEvents = "none";
+          if(x.tagName === "INPUT") x.readOnly = true;
+          if(x.tagName === "BUTTON") x.style.display = "none";
+        });
+        el.querySelector("#b-close").addEventListener("click", closeSheet);
+        return;
+      }
 
       el.querySelector("#b-save").addEventListener("click", function(){
         var payload = {
@@ -1471,12 +1668,19 @@ function openBillSheet(existing, resumeDraft){
         } catch(e){ toast(e.message, true); }
       });
 
-      var del = el.querySelector("#b-del");
+      // Two-tap delete so a stray tap can't wipe a bill.
+      var del = el.querySelector("#b-del"), delArmed = null;
       if(del) del.addEventListener("click", function(){
+        if(!delArmed){
+          del.textContent = "Tap again to delete";
+          delArmed = setTimeout(function(){ delArmed = null; del.textContent = "Delete"; }, 3000);
+          return;
+        }
+        clearTimeout(delArmed);
         writeOp(deleteBill(existing.id), "Bill deleted", this);
       });
 
-      el.querySelector("#b-desc").focus();
+      if(!existing) el.querySelector("#b-desc").focus();
     }
   );
 }
@@ -1670,120 +1874,161 @@ function unlockWithPasskey(saved){
   });
 }
 
+/* ---- Face ID lock state ----
+   "Unlocked" lasts for this app session (sessionStorage): closing the app or
+   tab locks it again. A fresh Google sign-in counts as unlocking. */
+function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
+function lsSet(k,v){ try{ if(v==null) localStorage.removeItem(k); else localStorage.setItem(k,v); }catch(e){} }
+function ssGet(k){ try{ return sessionStorage.getItem(k); }catch(e){ return null; } }
+function ssSet(k,v){ try{ if(v==null) sessionStorage.removeItem(k); else sessionStorage.setItem(k,v); }catch(e){} }
+
+function passkeyFor(email){
+  var saved = getStoredPasskey();
+  return (saved && saved.email === email && passkeySupported()) ? saved : null;
+}
+function isUnlocked(email){ return ssGet("pw_unlocked") === email; }
+function markUnlocked(email){ ssSet("pw_unlocked", email); }
+
 function offerPasskeySetup(email){
   if(!passkeySupported()) return;
-  var saved = getStoredPasskey();
-  if(saved && saved.email === email) return; // already set up on this device
+  if(passkeyFor(email)) return;                          // already set up here
+  if(lsGet("pw_passkey_dismissed") === email) return;    // said "Not now" before
   openSheetHtml(
-    '<h3>Faster sign-in on this device</h3>'+
-    '<p class="muted" style="font-size:13.5px;line-height:1.5;">Set up Face ID / Touch ID so next time you open Project W on this device, you can skip typing and just use your face or fingerprint.</p>'+
+    '<h3>Lock with Face ID?</h3>'+
+    '<p class="muted" style="font-size:13.5px;line-height:1.5;">Next time you open Project W on this device, you\'ll unlock it with Face ID / Touch ID / fingerprint instead of it just opening. You can turn this off any time from Edit.</p>'+
     '<div class="sheet-actions">'+
       '<button class="btn btn-ghost" id="pk-skip">Not now</button>'+
-      '<button class="btn btn-brand" id="pk-go">Enable Face ID</button>'+
+      '<button class="btn btn-brand" id="pk-go">Turn on</button>'+
     '</div>',
     function(el){
-      el.querySelector("#pk-skip").addEventListener("click", closeSheet);
+      el.querySelector("#pk-skip").addEventListener("click", function(){
+        lsSet("pw_passkey_dismissed", email);
+        closeSheet();
+      });
       el.querySelector("#pk-go").addEventListener("click", function(){
         var btn = this; btn.disabled = true;
         registerPasskey(email).then(function(){
+          markUnlocked(email);
           closeSheet();
-          toast("Face ID enabled on this device");
+          toast("Face ID lock is on for this device");
         }).catch(function(err){
           btn.disabled = false;
-          toast(err && err.message ? err.message : "Couldn't set that up", true);
+          toast(err && err.name==="NotAllowedError" ? "Cancelled" : (err && err.message ? err.message : "Couldn't set that up"), true);
         });
       });
     }
   );
 }
 
-function showSignIn(){
-  var saved = getStoredPasskey();
-  var canFaceId = saved && passkeySupported();
-
-  document.getElementById("boot").innerHTML =
-    '<div class="flag">🇱🇰</div>'+
-    '<h2>Project W</h2>'+
-    '<p>'+(canFaceId ? "Welcome back." : "Sign in with Google to see the itinerary and shared bills.")+'</p>'+
-    (canFaceId
-      ? '<button class="btn btn-brand btn-wide" id="faceid-signin" style="margin-top:18px;max-width:280px;">🔓 Sign in with Face ID</button>'+
-        '<button class="btn btn-ghost btn-wide" id="google-signin-alt" style="margin-top:10px;max-width:280px;">Use Google instead</button>'
-      : '<button class="google-btn" id="google-signin" style="margin-top:18px;max-width:280px;">'+
-          '<img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" alt="">'+
-          'Sign in with Google</button>');
-
-  function doGoogleSignIn(){
-    var provider = new firebase.auth.GoogleAuthProvider();
-    auth.signInWithPopup(provider).catch(function(err){
-      toast(err && err.message ? err.message : "Sign-in failed", true);
-    });
+/** The boot/sign-in container lives inside #app, which buildShell() replaces
+    once the app loads. Recreate it when needed (e.g. after signing out). */
+function bootEl(){
+  var b = document.getElementById("boot");
+  if(!b){
+    document.getElementById("app").innerHTML = '<div class="boot" id="boot"></div>';
+    b = document.getElementById("boot");
   }
+  return b;
+}
 
-  var gBtn = document.getElementById("google-signin");
-  if(gBtn) gBtn.addEventListener("click", doGoogleSignIn);
-  var gAlt = document.getElementById("google-signin-alt");
-  if(gAlt) gAlt.addEventListener("click", doGoogleSignIn);
+function showBootLoading(){
+  bootEl().innerHTML =
+    '<div class="flag">🇱🇰</div><h2>Project W</h2>'+
+    '<p id="boot-msg">Loading the trip…</p>'+
+    '<div class="spinner" id="boot-spinner"></div>'+
+    '<div id="boot-extra"></div>';
+}
 
-  var fBtn = document.getElementById("faceid-signin");
-  if(fBtn) fBtn.addEventListener("click", function(){
-    fBtn.disabled = true;
-    unlockWithPasskey(saved).then(function(){
-      // Biometric check passed. Firebase's own persisted session (already
-      // in this browser from the earlier Google sign-in) picks up from
-      // here via onAuthStateChanged — nothing else to do.
-      if(auth.currentUser){
-        // Already resolved; onAuthStateChanged already fired once, so
-        // re-trigger the boot flow manually.
-        S.me = normEmail(auth.currentUser.email);
-        S.myPhoto = auth.currentUser.photoURL || "";
-        document.getElementById("boot").innerHTML =
-          '<div class="flag">🇱🇰</div><h2>Project W</h2>'+
-          '<p id="boot-msg">Loading the trip…</p>'+
-          '<div class="spinner" id="boot-spinner"></div>'+
-          '<div id="boot-extra"></div>';
-        startListeners();
-      } else {
-        // Firebase's own session already expired/signed out — the biometric
-        // check alone can't re-establish identity without a backend, so
-        // fall back to Google.
-        toast("Session expired — please sign in with Google again.", true);
-        setStoredPasskey(null);
-        showSignIn();
-      }
-    }).catch(function(err){
-      fBtn.disabled = false;
-      toast(err && err.message ? err.message : "Face ID sign-in cancelled", true);
-    });
+function doGoogleSignIn(){
+  ssSet("pw_google_pending", "1");
+  var provider = new firebase.auth.GoogleAuthProvider();
+  provider.setCustomParameters({ prompt: "select_account" });
+  auth.signInWithPopup(provider).catch(function(err){
+    ssSet("pw_google_pending", null);
+    if(err && (err.code==="auth/popup-closed-by-user" || err.code==="auth/cancelled-popup-request")) return;
+    toast(err && err.message ? err.message : "Sign-in failed", true);
   });
 }
 
+function showSignIn(){
+  bootEl().innerHTML =
+    '<div class="flag">🇱🇰</div>'+
+    '<h2>Project W</h2>'+
+    '<p>Sign in with Google to see the itinerary and shared bills.</p>'+
+    '<button class="google-btn" id="google-signin" style="margin-top:18px;max-width:280px;">'+
+      '<img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" alt="">'+
+      'Sign in with Google</button>';
+  document.getElementById("google-signin").addEventListener("click", doGoogleSignIn);
+}
+
+function showLockScreen(user, saved){
+  var email = normEmail(user.email);
+  bootEl().innerHTML =
+    '<div class="flag">🔒</div>'+
+    '<h2>Project W</h2>'+
+    '<p>Welcome back'+(user.displayName ? ', '+esc(String(user.displayName).split(" ")[0]) : '')+'.</p>'+
+    '<button class="btn btn-brand btn-wide" id="faceid-unlock" style="margin-top:18px;max-width:280px;">Unlock with Face ID</button>'+
+    '<button class="btn btn-ghost btn-wide" id="lock-google" style="margin-top:10px;max-width:280px;">Use Google instead</button>';
+  var fBtn = document.getElementById("faceid-unlock");
+  function tryUnlock(){
+    fBtn.disabled = true;
+    unlockWithPasskey(saved).then(function(){
+      markUnlocked(email);
+      proceedBoot();
+    }).catch(function(err){
+      fBtn.disabled = false;
+      if(err && err.name === "NotAllowedError") return; // cancelled / timed out
+      toast(err && err.message ? err.message : "Couldn't unlock", true);
+    });
+  }
+  fBtn.addEventListener("click", tryUnlock);
+  document.getElementById("lock-google").addEventListener("click", function(){
+    auth.signOut();   // → sign-in screen; a fresh Google sign-in unlocks this session
+  });
+}
+
+var passkeyOffered = false;
+var nowTimer = null;
+
+function proceedBoot(){
+  showBootLoading();
+  startListeners();
+}
+
+function teardown(){
+  booted = false;
+  joinShown = false;
+  passkeyOffered = false;
+  if(unsubPeople) unsubPeople();
+  if(unsubBills) unsubBills();
+  if(unsubSettlements) unsubSettlements();
+  if(unsubItinerary) unsubItinerary();
+  unsubPeople = unsubBills = unsubSettlements = unsubItinerary = null;
+  latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
+  itinerarySeeded = false;
+  if(nowTimer){ clearInterval(nowTimer); nowTimer = null; }
+  closeSheet();
+}
+
 auth.onAuthStateChanged(function(user){
+  teardown();
   if(!user){
-    booted = false;
-    if(unsubPeople) unsubPeople();
-    if(unsubBills) unsubBills();
-    if(unsubSettlements) unsubSettlements();
-    if(unsubItinerary) unsubItinerary();
-    latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
-    itinerarySeeded = false;
+    ssSet("pw_unlocked", null);
     showSignIn();
     return;
   }
   S.me = normEmail(user.email);
   S.myPhoto = user.photoURL || "";
-  document.getElementById("boot").innerHTML =
-    '<div class="flag">🇱🇰</div><h2>Project W</h2>'+
-    '<p id="boot-msg">Loading the trip…</p>'+
-    '<div class="spinner" id="boot-spinner"></div>'+
-    '<div id="boot-extra"></div>';
-  startListeners();
 
-  // Offer passkey setup once the person is a confirmed member (not on the
-  // very first join screen — wait until they've actually joined).
-  var checkTimer = setInterval(function(){
-    if(booted){
-      clearInterval(checkTimer);
-      offerPasskeySetup(S.me);
-    }
-  }, 400);
+  if(ssGet("pw_google_pending")){
+    ssSet("pw_google_pending", null);
+    markUnlocked(S.me);
+  }
+
+  var saved = passkeyFor(S.me);
+  if(saved && !isUnlocked(S.me)){
+    showLockScreen(user, saved);
+    return;
+  }
+  proceedBoot();
 });
