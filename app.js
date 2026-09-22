@@ -663,6 +663,7 @@ function openProfileSheet(){
         writeOp(updateProfile(name, el.querySelector("#p-upi").value.trim()), "Saved", this);
       });
       el.querySelector("#p-signout").addEventListener("click", function(){
+        setStoredPasskey(null);
         auth.signOut();
       });
       el.querySelector("#p-name").focus();
@@ -800,18 +801,164 @@ document.addEventListener("click", function(e){
 
 /* ====================== Auth / Boot ====================== */
 
+/* ---- Passkey (WebAuthn) local re-entry ----
+   There's no backend here to mint Firebase custom tokens from a WebAuthn
+   assertion, so this isn't a second independent identity provider — it's a
+   device-local "fast unlock" for a Google session Firebase is already
+   keeping signed in (Firebase Auth persists sessions in this browser by
+   default). First sign-in is always Google. Right after that, we offer to
+   register a passkey (Face ID / Touch ID / fingerprint / device PIN) tied to
+   this browser profile. Next time the tab opens, if Firebase still has a
+   persisted session AND a passkey is registered for that account, we ask for
+   the biometric prompt before showing the app — so the phone/laptop is what's
+   gating access, not just "the browser remembered me". If Firebase's session
+   ever actually expires or is signed out, the person falls back to Google. */
+
+var PASSKEY_KEY = "pw_passkey_v1"; // { email, credId (base64url) }
+
+function passkeySupported(){
+  return !!(window.PublicKeyCredential && navigator.credentials);
+}
+function getStoredPasskey(){
+  try{ return JSON.parse(localStorage.getItem(PASSKEY_KEY) || "null"); }
+  catch(e){ return null; }
+}
+function setStoredPasskey(v){
+  try{
+    if(v) localStorage.setItem(PASSKEY_KEY, JSON.stringify(v));
+    else localStorage.removeItem(PASSKEY_KEY);
+  } catch(e){}
+}
+function b64urlToBuf(s){
+  s = s.replace(/-/g,"+").replace(/_/g,"/");
+  while(s.length % 4) s += "=";
+  var bin = atob(s), buf = new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++) buf[i] = bin.charCodeAt(i);
+  return buf.buffer;
+}
+function bufToB64url(buf){
+  var bytes = new Uint8Array(buf), bin = "";
+  for(var i=0;i<bytes.length;i++) bin += String.fromCharCode(bytes[i]);
+  return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+}
+function randomChallenge(){
+  var a = new Uint8Array(32);
+  crypto.getRandomValues(a);
+  return a;
+}
+
+function registerPasskey(email){
+  if(!passkeySupported()) return Promise.reject(new Error("Face ID / Touch ID isn't available in this browser."));
+  var userId = new TextEncoder().encode(email);
+  return navigator.credentials.create({
+    publicKey: {
+      challenge: randomChallenge(),
+      rp: { name: "Project W" },
+      user: { id: userId, name: email, displayName: pName(email) || email },
+      pubKeyCredParams: [{ type:"public-key", alg:-7 }, { type:"public-key", alg:-257 }],
+      authenticatorSelection: { authenticatorAttachment:"platform", userVerification:"required" },
+      timeout: 60000
+    }
+  }).then(function(cred){
+    setStoredPasskey({ email: email, credId: bufToB64url(cred.rawId) });
+    return true;
+  });
+}
+
+function unlockWithPasskey(saved){
+  return navigator.credentials.get({
+    publicKey: {
+      challenge: randomChallenge(),
+      allowCredentials: [{ id: b64urlToBuf(saved.credId), type:"public-key" }],
+      userVerification: "required",
+      timeout: 60000
+    }
+  });
+}
+
+function offerPasskeySetup(email){
+  if(!passkeySupported()) return;
+  var saved = getStoredPasskey();
+  if(saved && saved.email === email) return; // already set up on this device
+  openSheetHtml(
+    '<h3>Faster sign-in on this device</h3>'+
+    '<p class="muted" style="font-size:13.5px;line-height:1.5;">Set up Face ID / Touch ID so next time you open Project W on this device, you can skip typing and just use your face or fingerprint.</p>'+
+    '<div class="sheet-actions">'+
+      '<button class="btn btn-ghost" id="pk-skip">Not now</button>'+
+      '<button class="btn btn-brand" id="pk-go">Enable Face ID</button>'+
+    '</div>',
+    function(el){
+      el.querySelector("#pk-skip").addEventListener("click", closeSheet);
+      el.querySelector("#pk-go").addEventListener("click", function(){
+        var btn = this; btn.disabled = true;
+        registerPasskey(email).then(function(){
+          closeSheet();
+          toast("Face ID enabled on this device");
+        }).catch(function(err){
+          btn.disabled = false;
+          toast(err && err.message ? err.message : "Couldn't set that up", true);
+        });
+      });
+    }
+  );
+}
+
 function showSignIn(){
+  var saved = getStoredPasskey();
+  var canFaceId = saved && passkeySupported();
+
   document.getElementById("boot").innerHTML =
     '<div class="flag">🇱🇰</div>'+
     '<h2>Project W</h2>'+
-    '<p>Sign in with Google to see the itinerary and shared bills.</p>'+
-    '<button class="google-btn" id="google-signin" style="margin-top:18px;max-width:280px;">'+
-      '<img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" alt="">'+
-      'Sign in with Google</button>';
-  document.getElementById("google-signin").addEventListener("click", function(){
+    '<p>'+(canFaceId ? "Welcome back." : "Sign in with Google to see the itinerary and shared bills.")+'</p>'+
+    (canFaceId
+      ? '<button class="btn btn-brand btn-wide" id="faceid-signin" style="margin-top:18px;max-width:280px;">🔓 Sign in with Face ID</button>'+
+        '<button class="btn btn-ghost btn-wide" id="google-signin-alt" style="margin-top:10px;max-width:280px;">Use Google instead</button>'
+      : '<button class="google-btn" id="google-signin" style="margin-top:18px;max-width:280px;">'+
+          '<img src="https://www.gstatic.com/images/branding/product/1x/gsa_512dp.png" alt="">'+
+          'Sign in with Google</button>');
+
+  function doGoogleSignIn(){
     var provider = new firebase.auth.GoogleAuthProvider();
     auth.signInWithPopup(provider).catch(function(err){
       toast(err && err.message ? err.message : "Sign-in failed", true);
+    });
+  }
+
+  var gBtn = document.getElementById("google-signin");
+  if(gBtn) gBtn.addEventListener("click", doGoogleSignIn);
+  var gAlt = document.getElementById("google-signin-alt");
+  if(gAlt) gAlt.addEventListener("click", doGoogleSignIn);
+
+  var fBtn = document.getElementById("faceid-signin");
+  if(fBtn) fBtn.addEventListener("click", function(){
+    fBtn.disabled = true;
+    unlockWithPasskey(saved).then(function(){
+      // Biometric check passed. Firebase's own persisted session (already
+      // in this browser from the earlier Google sign-in) picks up from
+      // here via onAuthStateChanged — nothing else to do.
+      if(auth.currentUser){
+        // Already resolved; onAuthStateChanged already fired once, so
+        // re-trigger the boot flow manually.
+        S.me = normEmail(auth.currentUser.email);
+        S.myPhoto = auth.currentUser.photoURL || "";
+        document.getElementById("boot").innerHTML =
+          '<div class="flag">🇱🇰</div><h2>Project W</h2>'+
+          '<p id="boot-msg">Loading the trip…</p>'+
+          '<div class="spinner" id="boot-spinner"></div>'+
+          '<div id="boot-extra"></div>';
+        startListeners();
+      } else {
+        // Firebase's own session already expired/signed out — the biometric
+        // check alone can't re-establish identity without a backend, so
+        // fall back to Google.
+        toast("Session expired — please sign in with Google again.", true);
+        setStoredPasskey(null);
+        showSignIn();
+      }
+    }).catch(function(err){
+      fBtn.disabled = false;
+      toast(err && err.message ? err.message : "Face ID sign-in cancelled", true);
     });
   });
 }
@@ -834,4 +981,13 @@ auth.onAuthStateChanged(function(user){
     '<div class="spinner" id="boot-spinner"></div>'+
     '<div id="boot-extra"></div>';
   startListeners();
+
+  // Offer passkey setup once the person is a confirmed member (not on the
+  // very first join screen — wait until they've actually joined).
+  var checkTimer = setInterval(function(){
+    if(booted){
+      clearInterval(checkTimer);
+      offerPasskeySetup(S.me);
+    }
+  }, 400);
 });
