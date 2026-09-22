@@ -49,10 +49,8 @@ var DRIVE_LEGS = [["Airport → Kandy","~3–3.5h",1],["Kandy → N'Eliya","~2.5
   ["N'Eliya → Ella","~2–2.5h",3],["Ella → Mirissa","~3.5–4.5h",5],
   ["Mirissa → Galle","~1–1.5h",6],["Galle → Colombo","~2–2.5h",6]];
 
-var BUDGET_REF = [["Flights","₹28,000 / person"],["Food","₹1,300–1,500 / day"],
-  ["Car rental","₹45,000 total"],["Petrol","₹8,500 total"],["Stays","~₹34,300 total"]];
-
 var CATEGORIES = [
+  {id:"flights",label:"Flights",icon:"✈️"},
   {id:"stay",label:"Stay",icon:"🏨"},{id:"food",label:"Food",icon:"🍛"},
   {id:"transport",label:"Transport",icon:"🚗"},{id:"activity",label:"Activity",icon:"🥾"},
   {id:"shopping",label:"Shopping",icon:"🛍️"},{id:"other",label:"Other",icon:"📌"}
@@ -61,19 +59,90 @@ var CATEGORIES = [
 var VALID_CATEGORIES = CATEGORIES.map(function(c){ return c.id; });
 var MAX_DESC_LEN = 80, MAX_NAME_LEN = 40, MAX_UPI_LEN = 60, MAX_AMOUNT = 10000000;
 
-// The itinerary dates (17–23 Nov) don't carry a year in the data — this is
-// the trip year they resolve against for the "Right Now" view's date math.
-var TRIP_YEAR = 2026;
-var MONTH_NUM = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+/* ---- Trip settings (shared, editable in the app) ----
+   Stored in Firestore at trip/settings. These defaults come from the
+   Sri_Lanka_Plan spreadsheet (6 adults) and are used until someone saves. */
+var DEFAULT_SETTINGS = {
+  startDate: "2026-11-17",
+  endDate:   "2026-11-23",
+  airportRate: null,            // LKR you get for ₹1 at the airport counter, e.g. 3.40
+  budget: { flights:168000, stay:34300, food:58800, transport:53500, activity:0, shopping:0, other:0 }
+};
+function cloneSettings(x){ return JSON.parse(JSON.stringify(x)); }
 
-/** Parses a "17 Nov" style date string (from ITINERARY) into a real Date at local midnight. */
-function parseTripDate(dateStr){
-  var parts = String(dateStr||"").trim().split(/\s+/);
-  var dayNum = parseInt(parts[0],10);
-  var mon = MONTH_NUM[parts[1]];
-  if(!isFinite(dayNum) || mon===undefined) return null;
-  return new Date(TRIP_YEAR, mon, dayNum);
+var MONTH_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+var WEEKDAY_LONG = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
+function pad2(n){ return (n<10?"0":"")+n; }
+function ymdToDate(ymd){
+  var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(ymd||""));
+  return m ? new Date(+m[1], +m[2]-1, +m[3]) : null;
 }
+function dateToYmd(d){ return d.getFullYear()+"-"+pad2(d.getMonth()+1)+"-"+pad2(d.getDate()); }
+function addDays(d, n){ var x = new Date(d.getTime()); x.setDate(x.getDate()+n); return x; }
+function todayYmd(){ return dateToYmd(new Date()); }
+function fmtDayMonth(d){ return d.getDate()+" "+MONTH_SHORT[d.getMonth()]; }
+function fmtYmdShort(ymd){ var d = ymdToDate(ymd); return d ? fmtDayMonth(d) : ""; }
+function tripStart(){ return ymdToDate(S.settings.startDate) || ymdToDate(DEFAULT_SETTINGS.startDate); }
+function tripLength(){
+  var a = tripStart(), b = ymdToDate(S.settings.endDate);
+  if(!b) return 7;
+  return Math.max(1, Math.min(30, Math.round((b - a)/86400000) + 1));
+}
+function dayDate(n){ return addDays(tripStart(), n-1); }
+function tripRangeLabel(){
+  var a = tripStart(), b = dayDate(tripLength());
+  if(a.getMonth()===b.getMonth() && a.getFullYear()===b.getFullYear()) return a.getDate()+"–"+b.getDate()+" "+MONTH_SHORT[b.getMonth()];
+  return fmtDayMonth(a)+" – "+fmtDayMonth(b);
+}
+function isDuringTrip(){
+  var t = todayYmd();
+  return t >= S.settings.startDate && t <= dateToYmd(dayDate(tripLength()));
+}
+
+/* ---- Currency ----
+   Balances are always in ₹. A bill can be entered in LKR; it's converted
+   when saved, and the rate used is stored on the bill so every phone shows
+   the same number (rates are never silently re-fetched later).
+   Rates are "LKR per ₹1" (≈3.45), which is how money-changers quote them. */
+function fmtLkr(v){
+  return "LKR " + Number(round2(v)).toLocaleString("en-US", { minimumFractionDigits:0, maximumFractionDigits:2 });
+}
+function money(v, cur){ return cur === "LKR" ? fmtLkr(v) : inr(v); }
+function curSymbol(cur){ return cur === "LKR" ? "රු" : "₹"; }
+function lkrToInr(v, lkrPerInr){ return round2(Number(v) / Number(lkrPerInr)); }
+function validRate(r){ r = Number(r); return isFinite(r) && r >= 0.5 && r <= 50; }
+
+var fxMem = {};
+/** Market rate for a date (YYYY-MM-DD). Free, no key; two mirrors; cached
+    on the phone so previously-seen dates work offline. Today/future → latest. */
+function fetchLkrPerInr(ymd){
+  var tag = (!ymd || ymd >= todayYmd()) ? "latest" : ymd;
+  var cacheKey = "pw_fx_" + tag;
+  if(fxMem[tag] && (tag !== "latest" || Date.now() - fxMem[tag].at < 3*3600e3)) return Promise.resolve(fxMem[tag]);
+  var urls = [
+    "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@"+tag+"/v1/currencies/inr.json",
+    "https://"+tag+".currency-api.pages.dev/v1/currencies/inr.json"
+  ];
+  function attempt(i){
+    if(i >= urls.length){
+      var cached = null; try{ cached = JSON.parse(lsGet(cacheKey) || "null"); }catch(e){}
+      if(cached && validRate(cached.rate)) return cached;
+      throw new Error("Couldn't get the exchange rate (no signal?)");
+    }
+    return fetch(urls[i]).then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+      .then(function(j){
+        var rate = j && j.inr && Number(j.inr.lkr);
+        if(!validRate(rate)) throw new Error("bad rate");
+        var out = { rate: Math.round(rate*10000)/10000, date: String(j.date||ymd||""), at: Date.now() };
+        fxMem[tag] = out;
+        lsSet(cacheKey, JSON.stringify(out));
+        return out;
+      })
+      .catch(function(){ return attempt(i+1); });
+  }
+  return attempt(0);
+}
+
 
 /** Parses an item's time label ("2:30 PM") against a given day's Date. Returns a Date or null for non-clock labels like "Morning"/"—". */
 function parseItemTime(baseDate, timeStr){
@@ -98,13 +167,13 @@ try{
   });
 } catch(e){}
 
-var S = { me:"", myPhoto:"", joined:false, people:[], bills:[], settlements:[], itinerary:[], fetchedAt:"" };
+var S = { me:"", myPhoto:"", joined:false, people:[], bills:[], settlements:[], itinerary:[], settings: cloneSettings(DEFAULT_SETTINGS), fetchedAt:"" };
 var activeTab = "now";
 var openDay = 1;
 var booted = false;
 var syncState = "ok";
-var unsubPeople = null, unsubBills = null, unsubSettlements = null, unsubItinerary = null;
-var latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
+var unsubPeople = null, unsubBills = null, unsubSettlements = null, unsubItinerary = null, unsubTrip = null;
+var latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
 var itinerarySeeded = false;
 var joinShown = false;
 
@@ -277,7 +346,7 @@ function computeSettlements(bal){
 
 /* ====================== Validation (client-side mirror of old server checks) ====================== */
 
-function validateBill(payload, peopleEmails){
+function validateBillCore(payload, peopleEmails){
   var desc = cleanText(payload && payload.desc, MAX_DESC_LEN);
   if(!desc) throw new Error("Add a short description for the bill.");
 
@@ -371,6 +440,43 @@ function validateBill(payload, peopleEmails){
   return out;
 }
 
+/** Validates in the bill's own currency (what the person typed), then
+    converts money fields to ₹ for the balance math. For LKR bills the
+    original amounts and the rate used are kept alongside. Exact-split
+    amounts stay in the bill's currency: they're used as proportions, so the
+    currency doesn't change who owes what share. */
+function validateBill(payload, peopleEmails){
+  var out = validateBillCore(payload, peopleEmails);
+  var billDate = ymdToDate(payload && payload.billDate) ? payload.billDate : todayYmd();
+  out.billDate = billDate;
+  var cur = (payload && payload.currency === "LKR") ? "LKR" : "INR";
+  out.currency = cur;
+  if(cur === "INR"){ out.origAmount = null; out.fx = null; return out; }
+
+  var fx = payload.fx || {};
+  if(!validRate(fx.rate)) throw new Error("Set the exchange rate first (LKR for ₹1).");
+  var rate = Number(fx.rate);
+  out.fx = { rate: rate, source: (["day","airport","manual"].indexOf(fx.source) >= 0 ? fx.source : "manual"), date: String(fx.date || billDate) };
+
+  if(out.splitMode === "itemized"){
+    var origTotal = 0, inrTotal = 0;
+    out.items = out.items.map(function(it){
+      var inrAmt = lkrToInr(it.amount, rate);
+      if(!(inrAmt > 0)) throw new Error('"'+it.desc+'" is too small to convert to ₹.');
+      origTotal = round2(origTotal + it.amount);
+      inrTotal = round2(inrTotal + inrAmt);
+      return Object.assign({}, it, { origAmount: it.amount, amount: inrAmt });
+    });
+    out.origAmount = origTotal;
+    out.amount = inrTotal;
+  } else {
+    out.origAmount = out.amount;
+    out.amount = lkrToInr(out.amount, rate);
+    if(!(out.amount > 0)) throw new Error("That amount is too small to convert to ₹.");
+  }
+  return out;
+}
+
 /* ====================== Firestore bridge ====================== */
 
 function setSync(st){
@@ -422,7 +528,24 @@ function rebuildState(){
   var billsSnap = latestSnapshots.bills;
   var settlementsSnap = latestSnapshots.settlements;
   var itinerarySnap = latestSnapshots.itinerary;
-  if(!peopleSnap || !billsSnap || !settlementsSnap || !itinerarySnap) return; // wait for all four
+  var tripSnap = latestSnapshots.trip;
+  if(!peopleSnap || !billsSnap || !settlementsSnap || !itinerarySnap || !tripSnap) return; // wait for all
+
+  var settings = cloneSettings(DEFAULT_SETTINGS);
+  tripSnap.forEach(function(doc){
+    if(doc.id !== "settings") return;
+    var d = doc.data();
+    if(ymdToDate(d.startDate)) settings.startDate = d.startDate;
+    if(ymdToDate(d.endDate) && d.endDate >= settings.startDate) settings.endDate = d.endDate;
+    settings.airportRate = validRate(d.airportRate) ? Number(d.airportRate) : null;
+    if(d.budget && typeof d.budget === "object"){
+      CATEGORIES.forEach(function(c){
+        var v = Number(d.budget[c.id]);
+        settings.budget[c.id] = (isFinite(v) && v >= 0) ? v : 0;
+      });
+    }
+  });
+  S.settings = settings;
 
   var people = [];
   peopleSnap.forEach(function(doc){
@@ -457,6 +580,10 @@ function rebuildState(){
       splitAmounts: d.splitAmounts || null,
       splitShares: d.splitShares || null,
       items: Array.isArray(d.items) ? d.items : null,
+      currency: d.currency === "LKR" ? "LKR" : "INR",
+      origAmount: (d.currency === "LKR" && Number(d.origAmount) > 0) ? Number(d.origAmount) : null,
+      fx: (d.currency === "LKR" && d.fx && validRate(d.fx.rate)) ? d.fx : null,
+      billDate: ymdToDate(d.billDate) ? d.billDate : (tsToIso(d.createdAt) ? dateToYmd(new Date(tsToIso(d.createdAt))) : ""),
       addedBy: normEmail(d.addedBy)
     });
   });
@@ -499,6 +626,22 @@ function rebuildState(){
     });
     itinerary.sort(function(a,b){ return a.day-b.day; });
   }
+  // Day N's date is always start date + (N-1): changing the trip dates in
+  // settings re-dates every day. Days past the end date are hidden, not
+  // deleted, so shortening the trip by mistake loses nothing.
+  var byDay = {};
+  itinerary.forEach(function(d){ byDay[d.day] = d; });
+  S.settings = settings;
+  var dated = [];
+  for(var dn=1; dn<=tripLength(); dn++){
+    var base = byDay[dn] || { day:dn, title:"Day "+dn, stay:"", items:[], tip:"", placeholder:true };
+    var dd = dayDate(dn);
+    base.dateObj = dd;
+    base.date = fmtDayMonth(dd);
+    base.weekday = WEEKDAY_LONG[dd.getDay()];
+    dated.push(base);
+  }
+  itinerary = dated;
 
   var joined = false;
   for(var i=0;i<people.length;i++) if(people[i].email===S.me){ joined = true; break; }
@@ -578,6 +721,11 @@ function startListeners(){
 
   unsubItinerary = db.collection("itinerary").onSnapshot(function(snap){
     latestSnapshots.itinerary = snap;
+    rebuildState();
+  }, function(err){ serverFail(err); });
+
+  unsubTrip = db.collection("trip").onSnapshot(function(snap){
+    latestSnapshots.trip = snap;
     rebuildState();
   }, function(err){ serverFail(err); });
 }
@@ -696,6 +844,7 @@ function addBill(payload){
       splitAmounts: bill.splitAmounts || null,
       splitShares: bill.splitShares || null,
       items: bill.items || null,
+      currency: bill.currency, origAmount: bill.origAmount, fx: bill.fx, billDate: bill.billDate,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       deleted: false
@@ -715,6 +864,7 @@ function updateBill(id, payload){
       splitAmounts: bill.splitAmounts || null,
       splitShares: bill.splitShares || null,
       items: bill.items || null,
+      currency: bill.currency, origAmount: bill.origAmount, fx: bill.fx, billDate: bill.billDate,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
   } catch(e){ return Promise.reject(e); }
@@ -781,7 +931,7 @@ function buildShell(){
   document.getElementById("app").innerHTML =
     '<header class="topbar">'+
       '<div class="topbar-row"><h1 class="trip-title">🇱🇰 Project W</h1>'+
-      '<div class="trip-dates">17–23 Nov</div></div>'+
+      '<button class="trip-dates" id="trip-dates" data-action="trip-settings" title="Change trip dates"></button></div>'+
       '<div class="route-line">Colombo Airport → Kandy → Nuwara Eliya → Ella → Mirissa → Galle → Colombo</div>'+
       '<div class="whoami">'+
         '<span class="me"><span class="sync-dot" id="sync-dot"></span><span id="me-label"></span></span>'+
@@ -830,6 +980,8 @@ function render(){
   if(!booted) return;
   var me = person(S.me);
   document.getElementById("me-label").textContent = me.name + (me.upi ? " · " + me.upi : "");
+  var td = document.getElementById("trip-dates");
+  if(td) td.textContent = tripRangeLabel() + " ✎";
   var v = document.getElementById("view");
   if(activeTab==="now") v.innerHTML = viewNow();
   else if(activeTab==="itinerary") v.innerHTML = viewItinerary();
@@ -840,12 +992,19 @@ function render(){
 
 /* ====================== Views ====================== */
 
+function budgetChipHtml(){
+  var b = budgetSummary();
+  return '<div class="now-chip" data-action="goto-plan" style="cursor:pointer;"><div class="nc-k">Trip spend</div>'+
+    '<div class="nc-v'+(b.budget>0 && b.spent>b.budget?' neg':'')+'">'+inr(b.spent)+'<span class="muted" style="font-size:12px;font-weight:500;"> / '+inr(b.budget)+'</span></div>'+
+    barHtml(b.spent, b.budget)+'</div>';
+}
+
 function viewNow(){
   var now = new Date();
   var days = S.itinerary.slice().sort(function(a,b){ return a.day-b.day; });
   if(!days.length) return '<div class="empty"><span class="big">🗓️</span>No itinerary yet</div>';
 
-  var dated = days.map(function(d){ return { d:d, date: parseTripDate(d.date) }; }).filter(function(x){ return x.date; });
+  var dated = days.map(function(d){ return { d:d, date: d.dateObj }; }).filter(function(x){ return x.date; });
   var tripStart = dated.length ? dated[0].date : null;
   var tripEnd = dated.length ? new Date(dated[dated.length-1].date.getTime() + 24*3600*1000) : null;
 
@@ -866,7 +1025,7 @@ function viewNow(){
         '<div class="now-hero-big">'+(tripStart? daysLeft : "?")+'<span class="now-hero-unit">'+(daysLeft===1?" day":" days")+'</span></div>'+
         '<div class="now-hero-sub">'+esc(days[0].title)+' · '+esc(days[0].weekday+" "+days[0].date)+'</div>'+
       '</div>'+
-      '<div class="now-chips">'+balChip+
+      '<div class="now-chips">'+balChip+budgetChipHtml()+
         '<div class="now-chip"><div class="nc-k">People joined</div><div class="nc-v">'+S.people.length+'</div></div>'+
       '</div>'+
       '<div class="section-label">First up</div>'+
@@ -882,7 +1041,7 @@ function viewNow(){
         '<div class="now-hero-lbl">🎉 Trip complete</div>'+
         '<div class="now-hero-sub">'+inr(total)+' logged across '+S.bills.length+' bill'+(S.bills.length===1?"":"s")+'</div>'+
       '</div>'+
-      '<div class="now-chips">'+balChip+'</div>'+
+      '<div class="now-chips">'+balChip+budgetChipHtml()+'</div>'+
       '<div class="muted" style="font-size:12.5px;padding:10px 2px;">Head to Settle to clear any last balances.</div>';
   }
 
@@ -896,7 +1055,7 @@ function viewNow(){
     var upcoming = dated.filter(function(x){ return x.date > now; })[0] || dated[dated.length-1];
     return '<div class="card now-hero"><div class="now-hero-lbl">On the road</div>'+
       '<div class="now-hero-sub">Next: '+esc(upcoming.d.title)+'</div></div>'+
-      '<div class="now-chips">'+balChip+'</div>';
+      '<div class="now-chips">'+balChip+budgetChipHtml()+'</div>';
   }
 
   var d = todayEntry.d, baseDate = todayEntry.date;
@@ -927,7 +1086,7 @@ function viewNow(){
   return '<div class="card now-hero">'+upNext+
       '<div class="now-hero-foot">Day '+d.day+' of '+days.length+' · Staying in '+esc(d.stay)+'</div>'+
     '</div>'+
-    '<div class="now-chips">'+balChip+legChip+'</div>'+
+    '<div class="now-chips">'+balChip+legChip+'</div><div class="now-chips">'+budgetChipHtml()+'</div>'+
     '<div class="section-label">Today\'s schedule</div>'+
     '<div class="card">'+restOfDay+'</div>'+
     (d.tip ? '<div class="day-tip" style="margin:10px 2px;">📝 '+esc(d.tip)+'</div>' : '');
@@ -936,9 +1095,6 @@ function viewNow(){
 function viewItinerary(){
   var legs = DRIVE_LEGS.map(function(l){
     return '<div class="ref-chip"><div class="k">'+esc(l[0])+'</div><div class="v">'+esc(l[1])+'</div></div>';
-  }).join("");
-  var refs = BUDGET_REF.map(function(r){
-    return '<div class="ref-chip"><div class="k">'+esc(r[0])+'</div><div class="v">'+esc(r[1])+'</div></div>';
   }).join("");
   var days = S.itinerary.map(function(d){
     var items = d.items.map(function(it){
@@ -953,16 +1109,181 @@ function viewItinerary(){
       '<button class="day-head" data-action="toggle-day" data-day="'+d.day+'">'+
         '<div class="day-num">'+d.day+'</div>'+
         '<div class="day-meta"><div class="d1">'+esc(d.title)+'</div>'+
-        '<div class="d2">'+esc(d.weekday+" "+d.date)+' · Stay: '+esc(d.stay)+stayPin+'</div></div>'+
+        '<div class="d2">'+esc(d.weekday+" "+d.date)+(d.stay ? ' · Stay: '+esc(d.stay)+stayPin : '')+'</div></div>'+
         '<div class="day-chev">⌄</div></button>'+
       '<div class="day-body"><div class="day-body-in">'+items+tip+editBtn+'</div></div></div>';
   }).join("");
 
-  return '<div class="section-label">Drive times</div><div class="ref-scroller">'+legs+'</div>'+
-         '<div class="section-label">Day by day</div>'+days+
-         '<div class="section-label">Budget reference</div><div class="ref-scroller">'+refs+'</div>'+
-         '<div class="muted" style="font-size:11.5px;padding:4px 2px 10px;">Planning numbers only — log what you actually spend as bills.</div>';
+  return '<div class="plan-top">'+
+           '<div><div class="plan-dates">'+esc(tripRangeLabel())+' · '+S.itinerary.length+' day'+(S.itinerary.length===1?'':'s')+'</div>'+
+           '<div class="muted" style="font-size:12px;">Dates, budget and airport rate live in Trip settings</div></div>'+
+           '<button class="btn btn-ghost btn-sm" data-action="trip-settings">⚙️ Trip settings</button>'+
+         '</div>'+
+         viewBudgetCard()+
+         '<div class="section-label">Drive times</div><div class="ref-scroller">'+legs+'</div>'+
+         '<div class="section-label">Day by day</div>'+days;
 }
+
+/* ---- Live budget ---- */
+
+function spendByCategory(){
+  var m = {};
+  CATEGORIES.forEach(function(c){ m[c.id] = 0; });
+  S.bills.forEach(function(b){
+    var k = m.hasOwnProperty(b.category) ? b.category : "other";
+    m[k] = round2(m[k] + b.amount);
+  });
+  return m;
+}
+
+function budgetSummary(){
+  var sp = spendByCategory(), bud = S.settings.budget || {};
+  var spent = 0, budget = 0;
+  CATEGORIES.forEach(function(c){ spent += sp[c.id]; budget += Number(bud[c.id]) || 0; });
+  var mine = 0;
+  S.bills.forEach(function(b){ mine += Number(billShares(b)[S.me]) || 0; });
+  return { byCat: sp, spent: round2(spent), budget: round2(budget), mine: round2(mine) };
+}
+
+function barHtml(spent, budget){
+  var pct = budget > 0 ? Math.min(100, spent / budget * 100) : (spent > 0 ? 100 : 0);
+  var over = budget > 0 ? spent > budget : spent > 0;
+  return '<div class="bbar"><div class="bfill'+(over ? ' over' : '')+'" style="width:'+pct.toFixed(1)+'%"></div></div>';
+}
+
+function viewBudgetCard(){
+  var b = budgetSummary(), bud = S.settings.budget || {};
+  var left = round2(b.budget - b.spent);
+  var n = Math.max(1, S.people.length);
+  var rows = CATEGORIES.filter(function(c){ return (Number(bud[c.id]) || 0) > 0 || b.byCat[c.id] > 0; }).map(function(c){
+    var cb = Number(bud[c.id]) || 0, cs = b.byCat[c.id];
+    return '<div class="bud-row"><div class="bud-top"><span>'+c.icon+' '+esc(c.label)+'</span>'+
+      '<span class="'+(cb > 0 && cs > cb ? 'neg' : 'muted')+'">'+inr(cs)+(cb > 0 ? ' / '+inr(cb) : ' · no budget')+'</span></div>'+
+      barHtml(cs, cb)+'</div>';
+  }).join("");
+  return '<div class="card bud-card">'+
+    '<div class="bud-hero"><div><div class="now-hero-lbl">Trip budget</div>'+
+      '<div class="bud-big">'+inr(b.spent)+' <span class="muted" style="font-size:14px;font-weight:500;">of '+inr(b.budget)+'</span></div></div>'+
+      '<div class="bud-left '+(left < 0 ? 'neg' : 'pos')+'">'+(left < 0 ? inr(-left)+'<br><span>over</span>' : inr(left)+'<br><span>left</span>')+'</div></div>'+
+    barHtml(b.spent, b.budget)+
+    '<div class="muted" style="font-size:12px;margin:8px 0 10px;">'+inr(b.spent / n)+' per person so far · your share '+inr(b.mine)+'</div>'+
+    rows+
+    '<button class="btn btn-ghost btn-sm" data-action="trip-settings" style="margin-top:10px;">Edit budget</button>'+
+  '</div>';
+}
+
+/* ---- Trip settings sheet: dates, airport rate, budget ---- */
+
+function saveTripSettings(data){
+  try{
+    requireMember();
+    var a = ymdToDate(data.startDate), b = ymdToDate(data.endDate);
+    if(!a || !b) throw new Error("Pick both a start and an end date.");
+    if(b < a) throw new Error("The trip can't end before it starts.");
+    if(Math.round((b - a) / 86400000) + 1 > 30) throw new Error("Keep the trip to 30 days or fewer.");
+    if(data.airportRate != null && !validRate(data.airportRate)) throw new Error("Airport rate should be the LKR you get for ₹1 — something like 3.4.");
+    return db.collection("trip").doc("settings").set({
+      startDate: data.startDate,
+      endDate: data.endDate,
+      airportRate: data.airportRate == null ? null : Math.round(Number(data.airportRate) * 10000) / 10000,
+      budget: data.budget,
+      updatedBy: S.me,
+      updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+    }, { merge:true });
+  } catch(e){ return Promise.reject(e); }
+}
+
+function openTripSettingsSheet(){
+  var st = S.settings, bud = st.budget || {};
+  var budRows = CATEGORIES.map(function(c){
+    return '<div class="split-row"><span style="flex:1;font-size:13.5px;">'+c.icon+' '+esc(c.label)+'</span>'+
+      '<div class="amount-field" style="width:130px;"><span class="rupee">₹</span>'+
+      '<input type="number" inputmode="numeric" class="split-input" data-role="bud" data-id="'+c.id+'" style="width:100%;padding-left:24px;" value="'+(Number(bud[c.id]) || "")+'" placeholder="0"></div></div>';
+  }).join("");
+
+  openSheetHtml(
+    '<h3>Trip settings</h3>'+
+    '<div style="display:flex;gap:10px;">'+
+      '<div class="field" style="flex:1;"><label>Trip starts</label><input type="date" id="ts-start" value="'+esc(st.startDate)+'"></div>'+
+      '<div class="field" style="flex:1;"><label>Trip ends</label><input type="date" id="ts-end" value="'+esc(st.endDate)+'"></div>'+
+    '</div>'+
+    '<div class="split-hint" id="ts-len" style="margin:-6px 0 14px;"></div>'+
+    '<div class="field"><label>Airport exchange rate</label>'+
+      '<div class="fx-line">₹1 = <input type="number" inputmode="decimal" step="0.01" id="ts-rate" class="split-input" style="width:90px;" value="'+(st.airportRate || "")+'" placeholder="e.g. 3.40"> LKR</div>'+
+      '<div class="split-hint" id="ts-market">Checking today\'s market rate…</div></div>'+
+    '<div class="field"><label>Budget (whole group, in ₹)</label>'+budRows+
+      '<div class="split-hint" id="ts-budtotal"></div></div>'+
+    '<div class="sheet-actions"><button class="btn btn-brand" id="ts-save">Save</button></div>',
+    function(el){
+      var startIn = el.querySelector("#ts-start"), endIn = el.querySelector("#ts-end");
+
+      function lenHint(){
+        var a = ymdToDate(startIn.value), b = ymdToDate(endIn.value);
+        var h = el.querySelector("#ts-len");
+        if(!a || !b){ h.textContent = ""; return; }
+        var n = Math.round((b - a) / 86400000) + 1;
+        if(n < 1){ h.textContent = "The end date is before the start date."; return; }
+        var maxPlanned = 0;
+        S.itinerary.forEach(function(d){ if(!d.placeholder) maxPlanned = Math.max(maxPlanned, d.day); });
+        var extra = "";
+        if(n < maxPlanned) extra = " · Days "+(n + 1)+"–"+maxPlanned+" will be hidden (not deleted) — extend again to bring them back.";
+        else if(n > S.itinerary.length) extra = " · Adds "+(n - S.itinerary.length)+" empty day"+(n - S.itinerary.length === 1 ? "" : "s")+" to plan.";
+        h.textContent = n+" day"+(n === 1 ? "" : "s")+" · "+WEEKDAY_LONG[a.getDay()]+" "+fmtDayMonth(a)+" → "+WEEKDAY_LONG[b.getDay()]+" "+fmtDayMonth(b)+extra;
+      }
+
+      function budTotal(){
+        var t = 0;
+        el.querySelectorAll('[data-role="bud"]').forEach(function(i){ t += Number(i.value) || 0; });
+        el.querySelector("#ts-budtotal").textContent = "Total "+inr(t)+" · "+inr(t / Math.max(1, S.people.length))+" per person";
+      }
+
+      // Moving the start date shifts the whole trip, keeping its length.
+      var lastStart = ymdToDate(startIn.value);
+      startIn.addEventListener("change", function(){
+        var a = ymdToDate(startIn.value), b = ymdToDate(endIn.value);
+        if(a && b && lastStart){
+          var len = Math.round((b - lastStart) / 86400000);
+          endIn.value = dateToYmd(addDays(a, Math.max(0, len)));
+        }
+        if(a) lastStart = a;
+        lenHint();
+      });
+      endIn.addEventListener("change", lenHint);
+      el.querySelectorAll('[data-role="bud"]').forEach(function(i){ i.addEventListener("input", budTotal); });
+      lenHint();
+      budTotal();
+
+      fetchLkrPerInr(todayYmd()).then(function(r){
+        var m = el.querySelector("#ts-market");
+        if(!m) return;
+        m.innerHTML = "Today's market rate: ₹1 = "+r.rate+" LKR. Airport counters usually give a little less. "+
+          '<a href="#" id="ts-use-market">Use this</a>';
+        el.querySelector("#ts-use-market").addEventListener("click", function(e){
+          e.preventDefault();
+          el.querySelector("#ts-rate").value = r.rate;
+        });
+      }).catch(function(){
+        var m = el.querySelector("#ts-market");
+        if(m) m.textContent = "Enter the rate from your airport exchange receipt (LKR you got for ₹1).";
+      });
+
+      el.querySelector("#ts-save").addEventListener("click", function(){
+        var budget = {};
+        el.querySelectorAll('[data-role="bud"]').forEach(function(i){
+          budget[i.dataset.id] = Math.max(0, Math.round(Number(i.value) || 0));
+        });
+        var rateVal = el.querySelector("#ts-rate").value.trim();
+        writeOp(saveTripSettings({
+          startDate: startIn.value,
+          endDate: endIn.value,
+          airportRate: rateVal === "" ? null : Number(rateVal),
+          budget: budget
+        }), "Trip settings saved", this);
+      });
+    }
+  );
+}
+
 
 function viewBalances(){
   var bal = computeBalances();
@@ -1013,8 +1334,10 @@ function viewBills(){
     return '<div class="bill-row" data-action="open-bill" data-id="'+esc(b.id)+'">'+
       '<div class="bill-icon">'+(b.splitMode==="itemized"?"🧾":catIcon(b.category))+'</div>'+
       '<div class="bill-mid"><div class="bill-desc">'+esc(b.desc)+'</div>'+
-      '<div class="bill-sub">'+esc(pName(b.paidBy))+' paid · '+splitTxt+'</div></div>'+
-      '<div class="bill-amt">'+inr(b.amount)+'</div></div>';
+      '<div class="bill-sub">'+(b.billDate ? esc(fmtYmdShort(b.billDate))+' · ' : '')+esc(pName(b.paidBy))+' paid · '+splitTxt+'</div></div>'+
+      '<div class="bill-amt">'+(b.currency==="LKR" && b.origAmount
+        ? fmtLkr(b.origAmount)+'<div class="bill-sub" style="text-align:right;">'+inr(b.amount)+'</div>'
+        : inr(b.amount))+'</div></div>';
   }).join("");
   var total = S.bills.reduce(function(s,b){ return s+b.amount; }, 0);
   return '<button class="btn btn-brand btn-wide scan-cta" data-action="scan-bill">📷 Scan a bill</button>'+
@@ -1276,6 +1599,7 @@ function scanReceiptImage(file, btn){
     var text = result && result.data && result.data.text || "";
     var lines = parseReceiptLines(text);
     lines.title = guessReceiptTitle(text);
+    lines.lkr = /\bLKR\b|රු/i.test(text);
     return lines;
   }).catch(function(err){
     if(btn){ btn.disabled = false; progress(label); }
@@ -1291,7 +1615,7 @@ function openReceiptReviewSheet(candidates, onConfirm, onBack){
       return '<div class="split-row">'+
         '<div class="chip'+(picked[i]?" on":"")+'" data-role="cand-toggle" data-idx="'+i+'" style="flex:1;text-align:left;display:flex;justify-content:space-between;gap:8px;">'+
           '<span>'+esc(c.desc)+(c.summary?' <span class="muted" style="font-weight:500;">· total line</span>':'')+'</span>'+
-          '<span>'+inr(c.amount)+'</span></div>'+
+          '<span>'+money(c.amount, draftCurrency)+'</span></div>'+
       '</div>';
     }).join("");
   }
@@ -1309,7 +1633,7 @@ function openReceiptReviewSheet(candidates, onConfirm, onBack){
     function(el){
       function refresh(){
         el.querySelector("#cand-list").innerHTML = renderList();
-        el.querySelector("#cand-sum").textContent = "Selected: " + inr(pickedSum());
+        el.querySelector("#cand-sum").textContent = "Selected: " + money(pickedSum(), draftCurrency);
         wire();
       }
       function wire(){
@@ -1340,6 +1664,14 @@ var draftAmounts = {}, draftShares = {};
 var draftItems = []; // itemized mode: [{ localId, desc, amount, people:[email], mode:"equal"|"percent", percents:{} }]
 var draftItemSeq = 0;
 var draftDesc = "";
+var draftCurrency = "INR", draftBillDate = "", draftFx = { rate:null, source:"day", date:null };
+var fxToken = 0;
+
+function defaultCurrency(){
+  var last = lsGet("pw_last_cur");
+  if(last === "INR" || last === "LKR") return last;
+  return isDuringTrip() ? "LKR" : "INR";
+}
 
 function newDraftItem(desc, amount){
   draftItemSeq++;
@@ -1356,11 +1688,21 @@ function openBillSheet(existing, resumeDraft, autoScan){
     draftAmounts = existing && existing.splitAmounts ? Object.assign({}, existing.splitAmounts) : {};
     draftShares = existing && existing.splitShares ? Object.assign({}, existing.splitShares) : {};
     draftItemSeq = 0;
+    draftCurrency = existing ? (existing.currency || "INR") : defaultCurrency();
+    draftBillDate = (existing && existing.billDate) ? existing.billDate : todayYmd();
+    draftFx = (existing && existing.fx) ? Object.assign({}, existing.fx)
+            : { rate:null, source: (lsGet("pw_last_fxsrc") === "airport" ? "airport" : "day"), date:null };
     draftItems = (existing && existing.items) ? existing.items.map(function(it){
       draftItemSeq++;
-      return { localId:"it"+draftItemSeq, desc:it.desc, amount:it.amount, people:(it.people||[]).slice(), mode:it.mode||"equal", percents:Object.assign({},it.percents||{}) };
+      var shown = (draftCurrency === "LKR" && Number(it.origAmount) > 0) ? Number(it.origAmount) : it.amount;
+      return { localId:"it"+draftItemSeq, desc:it.desc, amount:shown, people:(it.people||[]).slice(), mode:it.mode||"equal", percents:Object.assign({},it.percents||{}) };
     }) : [];
   }
+  /** Formats an amount in the bill's own currency (what's being typed). */
+  function cm(v){ return money(v, draftCurrency); }
+  var curChips = [["INR","₹ Rupees"],["LKR","රු LKR"]].map(function(c){
+    return '<div class="chip'+(draftCurrency===c[0]?" on":"")+'" data-role="cur" data-id="'+c[0]+'">'+c[1]+'</div>';
+  }).join("");
 
   var payChips = S.people.map(function(p){
     return '<div class="chip'+(draftPaidBy===p.email?" on":"")+'" data-role="paid" data-id="'+esc(p.email)+'">'+esc(p.name)+'</div>';
@@ -1368,7 +1710,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
   var catChips = CATEGORIES.map(function(c){
     return '<div class="chip'+(draftCat===c.id?" on":"")+'" data-role="cat" data-id="'+c.id+'">'+c.icon+' '+c.label+'</div>';
   }).join("");
-  var modeChips = [["equal","Equal"],["exact","Exact ₹"],["shares","Shares"],["itemized","By item"]].map(function(m){
+  var modeChips = [["equal","Equal"],["exact","Exact amounts"],["shares","Shares"],["itemized","By item"]].map(function(m){
     return '<div class="chip'+(draftMode===m[0]?" on":"")+'" data-role="mode" data-id="'+m[0]+'">'+m[1]+'</div>';
   }).join("");
 
@@ -1388,7 +1730,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
       return '<div class="split-row" data-person="'+esc(p.email)+'">'+
         '<div class="chip'+(included?" on":"")+'" data-role="split" data-id="'+esc(p.email)+'" style="flex:1;text-align:left;">'+esc(p.name)+'</div>'+
         '<input type="number" inputmode="decimal" class="split-input" data-role="'+draftMode+'-input" data-id="'+esc(p.email)+'" '+
-          'style="width:84px;'+(included?"":"opacity:.4;")+'" placeholder="'+(draftMode==="exact"?"₹0":"1")+'" value="'+esc(val)+'" '+(included?"":"disabled")+'>'+
+          'style="width:84px;'+(included?"":"opacity:.4;")+'" placeholder="'+(draftMode==="exact"?"0":"1")+'" value="'+esc(val)+'" '+(included?"":"disabled")+'>'+
         '</div>';
     }).join("");
     return '<div id="b-split-chips">'+rows+'</div><div class="split-hint" id="b-hint"></div>';
@@ -1412,20 +1754,20 @@ function openBillSheet(existing, resumeDraft, autoScan){
         percentRow = '<div style="margin-top:8px;">'+it.people.map(function(e){
           return '<div class="split-row"><span style="flex:1;font-size:12.5px;">'+esc(pName(e))+'</span>'+
             '<input type="number" inputmode="decimal" class="split-input" data-role="item-percent" data-item="'+it.localId+'" data-id="'+esc(e)+'" style="width:64px;" value="'+(it.percents[e]!=null?it.percents[e]:"")+'" placeholder="%"></div>';
-        }).join("")+'<div class="split-hint">'+Math.round(pctSum)+'% of '+inr(it.amount)+'</div></div>';
+        }).join("")+'<div class="split-hint">'+Math.round(pctSum)+'% of '+cm(it.amount)+'</div></div>';
       }
       return '<div class="card" style="padding:12px 14px;margin-bottom:8px;" data-item-card="'+it.localId+'">'+
         '<div style="display:flex;gap:8px;align-items:center;">'+
           '<input type="text" class="split-input" data-role="item-desc" data-item="'+it.localId+'" style="flex:1;" maxlength="80" value="'+esc(it.desc)+'" placeholder="Item name">'+
-          '<div class="amount-field" style="width:96px;"><span class="rupee">₹</span>'+
-            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:20px;" value="'+(it.amount||"")+'" placeholder="0"></div>'+
+          '<div class="amount-field" style="width:104px;"><span class="rupee cur-sym">'+curSymbol(draftCurrency)+'</span>'+
+            '<input type="number" inputmode="decimal" class="split-input" data-role="item-amount" data-item="'+it.localId+'" style="width:100%;padding-left:24px;" value="'+(it.amount||"")+'" placeholder="0"></div>'+
           '<button class="btn btn-line btn-sm" data-role="item-del" data-item="'+it.localId+'" style="padding:6px 9px;">✕</button>'+
         '</div>'+
         '<div class="chip-grid" style="margin-top:8px;">'+peopleChips+'</div>'+
         '<div style="margin-top:8px;">'+modeToggle+'</div>'+
         percentRow+
       '</div>';
-    }).join("") + '<div class="split-hint" id="b-items-total" style="margin-top:4px;">Items total: '+inr(itemTotal())+'</div>';
+    }).join("") + '<div class="split-hint" id="b-items-total" style="margin-top:4px;"></div>';
   }
 
   // Firestore rules only let the person who added a bill change or delete it.
@@ -1437,8 +1779,20 @@ function openBillSheet(existing, resumeDraft, autoScan){
     (readOnly ? '<div class="day-tip" style="margin:-4px 0 12px;font-style:normal;">Added by '+esc(pName(existing.addedBy))+' — only they can change or delete it.</div>' : '')+
     '<div class="field"><label>What was it for</label>'+
       '<input type="text" id="b-desc" maxlength="80" placeholder="e.g. Dinner in Ella" value="'+esc(resumeDraft ? draftDesc : (existing ? existing.desc : ""))+'"></div>'+
-    '<div class="field" id="b-amount-field" style="display:'+(draftMode==="itemized"?"none":"block")+';"><label>Amount</label><div class="amount-field"><span class="rupee">₹</span>'+
-      '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+(existing?existing.amount:"")+'"></div></div>'+
+    '<div style="display:flex;gap:10px;">'+
+      '<div class="field" style="flex:0 0 42%;"><label>Date</label><input type="date" id="b-date" value="'+esc(draftBillDate)+'" max="'+esc(dateToYmd(addDays(new Date(),1)))+'"></div>'+
+      '<div class="field" style="flex:1;"><label>Paid in</label><div class="chip-grid">'+curChips+'</div></div>'+
+    '</div>'+
+    '<div class="fx-box" id="b-fx" style="display:'+(draftCurrency==="LKR"?"block":"none")+';">'+
+      '<div class="chip-grid" style="margin-bottom:8px;">'+
+        '<div class="chip" data-role="fxsrc" data-id="day">📈 That day\'s rate</div>'+
+        '<div class="chip" data-role="fxsrc" data-id="airport">🛫 Airport rate</div>'+
+      '</div>'+
+      '<div class="fx-line">₹1 = <input type="number" inputmode="decimal" step="0.01" id="b-rate" class="split-input" style="width:84px;" placeholder="3.45"> LKR</div>'+
+      '<div class="split-hint" id="b-fx-note"></div>'+
+    '</div>'+
+    '<div class="field" id="b-amount-field" style="display:'+(draftMode==="itemized"?"none":"block")+';"><label>Amount</label><div class="amount-field"><span class="rupee cur-sym">'+curSymbol(draftCurrency)+'</span>'+
+      '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+(existing ? (existing.currency==="LKR" && existing.origAmount ? existing.origAmount : existing.amount) : "")+'"></div><div class="split-hint" id="b-conv"></div></div>'+
     '<div class="field"><label>Category</label><div class="chip-grid">'+catChips+'</div></div>'+
     '<div class="field"><label>Who paid</label><div class="chip-grid">'+payChips+'</div></div>'+
     '<div class="field"><label>Split</label><div class="chip-grid" style="margin-bottom:10px;">'+modeChips+'</div>'+
@@ -1461,22 +1815,100 @@ function openBillSheet(existing, resumeDraft, autoScan){
     function(el){
       function amt(){ return parseFloat(el.querySelector("#b-amount").value) || 0; }
 
+      /* ---- currency / exchange rate ---- */
+      var fxStatus = validRate(draftFx.rate) ? "ok" : "none";
+
+      function updateConv(){
+        var total = draftMode === "itemized" ? itemTotal() : amt();
+        var txt = "";
+        if(draftCurrency === "LKR"){
+          txt = validRate(draftFx.rate) ? ("= " + inr(lkrToInr(total, draftFx.rate)) + " at ₹1 = " + draftFx.rate + " LKR") : "Waiting for the exchange rate…";
+        }
+        var c = el.querySelector("#b-conv"); if(c) c.textContent = txt;
+        var t = el.querySelector("#b-items-total");
+        if(t) t.textContent = "Items total: " + cm(total) + (draftCurrency === "LKR" && validRate(draftFx.rate) ? "  (= " + inr(lkrToInr(total, draftFx.rate)) + ")" : "");
+      }
+
+      function updateFxUI(){
+        el.querySelector("#b-fx").style.display = draftCurrency === "LKR" ? "block" : "none";
+        el.querySelectorAll('[data-role="cur"]').forEach(function(x){ x.classList.toggle("on", x.dataset.id === draftCurrency); });
+        el.querySelectorAll('[data-role="fxsrc"]').forEach(function(x){ x.classList.toggle("on", x.dataset.id === draftFx.source); });
+        el.querySelectorAll(".cur-sym").forEach(function(x){ x.textContent = curSymbol(draftCurrency); });
+        var rateIn = el.querySelector("#b-rate");
+        if(document.activeElement !== rateIn) rateIn.value = validRate(draftFx.rate) ? draftFx.rate : "";
+        var note = "";
+        if(fxStatus === "loading") note = "Getting the rate for " + fmtYmdShort(draftBillDate) + "…";
+        else if(fxStatus === "noairport") note = "No airport rate saved yet — add it in ⚙️ Trip settings (Plan tab), or type the rate above.";
+        else if(fxStatus === "error") note = "Couldn't get the rate (no signal?). Type it above, or save an airport rate in Trip settings.";
+        else if(fxStatus === "fellback") note = "No signal for the day's rate — using your airport rate instead.";
+        else if(draftFx.source === "day" && validRate(draftFx.rate)) note = "Market rate for " + fmtYmdShort(draftFx.date) + ".";
+        else if(draftFx.source === "airport" && validRate(draftFx.rate)) note = "Your group's airport rate.";
+        else if(draftFx.source === "manual") note = "Rate typed in by hand.";
+        el.querySelector("#b-fx-note").textContent = note;
+        updateConv();
+        hint();
+      }
+
+      function resolveRate(){
+        if(draftCurrency !== "LKR"){ updateFxUI(); return; }
+        var token = ++fxToken;
+        if(draftFx.source === "airport"){
+          if(validRate(S.settings.airportRate)){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "ok"; }
+          else { draftFx.rate = null; fxStatus = "noairport"; }
+          updateFxUI(); return;
+        }
+        if(draftFx.source === "manual"){ fxStatus = validRate(draftFx.rate) ? "ok" : "none"; updateFxUI(); return; }
+        fxStatus = "loading"; updateFxUI();
+        fetchLkrPerInr(draftBillDate).then(function(r){
+          if(token !== fxToken) return;
+          draftFx = { rate:r.rate, source:"day", date:r.date }; fxStatus = "ok"; updateFxUI();
+        }).catch(function(){
+          if(token !== fxToken) return;
+          if(validRate(S.settings.airportRate)){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "fellback"; }
+          else { draftFx = { rate:null, source:"day", date:null }; fxStatus = "error"; }
+          updateFxUI();
+        });
+      }
+
+      el.querySelectorAll('[data-role="cur"]').forEach(function(c){
+        c.addEventListener("click", function(){
+          draftCurrency = c.dataset.id;
+          if(draftCurrency === "LKR" && !validRate(draftFx.rate)) resolveRate(); else updateFxUI();
+        });
+      });
+      el.querySelectorAll('[data-role="fxsrc"]').forEach(function(c){
+        c.addEventListener("click", function(){ draftFx = { rate:null, source:c.dataset.id, date:null }; resolveRate(); });
+      });
+      el.querySelector("#b-rate").addEventListener("input", function(){
+        var v = parseFloat(this.value);
+        draftFx = { rate: validRate(v) ? Math.round(v*10000)/10000 : null, source:"manual", date:draftBillDate };
+        fxStatus = validRate(v) ? "ok" : "none";
+        el.querySelectorAll('[data-role="fxsrc"]').forEach(function(x){ x.classList.remove("on"); });
+        el.querySelector("#b-fx-note").textContent = validRate(v) ? "Rate typed in by hand." : "Enter LKR for ₹1, e.g. 3.45";
+        updateConv(); hint();
+      });
+      el.querySelector("#b-date").addEventListener("change", function(){
+        if(!ymdToDate(this.value)) return;
+        draftBillDate = this.value;
+        if(draftCurrency === "LKR" && draftFx.source === "day") resolveRate();
+      });
+
       function hint(){
         var h = el.querySelector("#b-hint");
         if(!h) return;
         if(!draftSplit.length){ h.textContent = "Pick at least one person"; return; }
         if(draftMode === "equal"){
-          h.textContent = draftSplit.length+" people · "+inr(amt()/draftSplit.length)+" each";
+          h.textContent = draftSplit.length+" people · "+cm(amt()/draftSplit.length)+" each";
         } else if(draftMode === "exact"){
           var sum = 0; draftSplit.forEach(function(e){ sum += Number(draftAmounts[e])||0; });
           var diff = round2(amt() - sum);
-          h.textContent = inr(sum)+" of "+inr(amt())+" assigned"+(Math.abs(diff)>0.01?" · "+(diff>0?inr(diff)+" left over":inr(-diff)+" over"):" · ✓ matches");
+          h.textContent = cm(sum)+" of "+cm(amt())+" assigned"+(Math.abs(diff)>0.01?" · "+(diff>0?cm(diff)+" left over":cm(-diff)+" over"):" · ✓ matches");
         } else {
           var totalW = 0; draftSplit.forEach(function(e){ totalW += Number(draftShares[e])||0; });
           if(totalW<=0){ h.textContent = "Give at least one share"; return; }
           var parts = draftSplit.map(function(e){
             var w = Number(draftShares[e])||0;
-            return pName(e)+" "+inr(amt()*(w/totalW));
+            return pName(e)+" "+cm(amt()*(w/totalW));
           });
           h.textContent = parts.join(" · ");
         }
@@ -1491,6 +1923,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
       function rebuildItemsSection(){
         el.querySelector("#b-items-list").innerHTML = renderItemsSection();
         wireItemsSection();
+        updateConv();
       }
 
       function wireItemsSection(){
@@ -1504,8 +1937,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
           inp.addEventListener("input", function(){
             var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
             if(it) it.amount = parseFloat(inp.value)||0;
-            var totalEl = el.querySelector("#b-items-total");
-            if(totalEl) totalEl.textContent = "Items total: "+inr(itemTotal());
+            updateConv();
           });
         });
         el.querySelectorAll('[data-role="item-person"]').forEach(function(c){
@@ -1538,7 +1970,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
             var sumPct = 0; it.people.forEach(function(e){ sumPct += Number(it.percents[e])||0; });
             var hintEl = el.querySelector('[data-item-card="'+it.localId+'"] .split-hint');
             if(hintEl){
-              hintEl.textContent = Math.round(sumPct*100)/100 + '% of ' + inr(it.amount) + (Math.abs(sumPct-100) <= 0.5 ? " ✓" : " — needs to total 100%");
+              hintEl.textContent = Math.round(sumPct*100)/100 + '% of ' + cm(it.amount) + (Math.abs(sumPct-100) <= 0.5 ? " ✓" : " — needs to total 100%");
             }
           });
         });
@@ -1575,7 +2007,8 @@ function openBillSheet(existing, resumeDraft, autoScan){
 
       wireSplitSection();
       hint();
-      el.querySelector("#b-amount").addEventListener("input", hint);
+      el.querySelector("#b-amount").addEventListener("input", function(){ hint(); updateConv(); });
+      if(draftCurrency === "LKR" && !validRate(draftFx.rate)) resolveRate(); else updateFxUI();
 
       el.querySelectorAll('[data-role="paid"]').forEach(function(c){
         c.addEventListener("click", function(){
@@ -1638,6 +2071,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
           // bill sheet with it intact — whether they add items or go back.
           draftDesc = el.querySelector("#b-desc").value;
           draftMode = "itemized";
+          if(lines.lkr) draftCurrency = "LKR";
           var existingSnapshot = existing;
           openReceiptReviewSheet(lines, function(picked){
             // Drop blank placeholder rows so they don't block saving.
@@ -1671,8 +2105,15 @@ function openBillSheet(existing, resumeDraft, autoScan){
         var payload = {
           desc: el.querySelector("#b-desc").value.trim(),
           category: draftCat, paidBy: draftPaidBy,
-          splitMode: draftMode
+          splitMode: draftMode,
+          currency: draftCurrency, billDate: draftBillDate,
+          fx: draftCurrency === "LKR" ? Object.assign({}, draftFx) : null
         };
+        if(draftCurrency === "LKR" && !validRate(draftFx.rate)){
+          toast(fxStatus === "loading" ? "Still getting the exchange rate — one sec" : "Set the exchange rate first", true); return;
+        }
+        lsSet("pw_last_cur", draftCurrency);
+        if(draftCurrency === "LKR" && draftFx.source !== "manual") lsSet("pw_last_fxsrc", draftFx.source);
         if(draftMode==="itemized"){
           payload.items = draftItems.map(function(it){
             return { desc:it.desc, amount:it.amount, people:it.people.slice(), mode:it.mode, percents:Object.assign({},it.percents) };
@@ -1790,6 +2231,12 @@ document.addEventListener("click", function(e){
     var d = parseInt(t.dataset.day,10);
     openDay = (openDay===d) ? 0 : d;
     render();
+  }
+  else if(a==="trip-settings"){
+    openTripSettingsSheet();
+  }
+  else if(a==="goto-plan"){
+    setTab("itinerary");
   }
   else if(a==="scan-bill"){
     openBillSheet(null, false, true);
@@ -2030,8 +2477,9 @@ function teardown(){
   if(unsubBills) unsubBills();
   if(unsubSettlements) unsubSettlements();
   if(unsubItinerary) unsubItinerary();
-  unsubPeople = unsubBills = unsubSettlements = unsubItinerary = null;
-  latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null };
+  if(unsubTrip) unsubTrip();
+  unsubPeople = unsubBills = unsubSettlements = unsubItinerary = unsubTrip = null;
+  latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
   itinerarySeeded = false;
   if(nowTimer){ clearInterval(nowTimer); nowTimer = null; }
   closeSheet();
