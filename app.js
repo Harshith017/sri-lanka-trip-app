@@ -105,7 +105,8 @@ function isDuringTrip(){
    the same number (rates are never silently re-fetched later).
    Rates are "LKR per ₹1" (≈3.45), which is how money-changers quote them. */
 function fmtLkr(v){
-  return "LKR " + Number(round2(v)).toLocaleString("en-US", { minimumFractionDigits:0, maximumFractionDigits:2 });
+  var n = round2(v), frac = Math.round(Math.abs(n)*100) % 100 !== 0;
+  return "LKR " + Number(n).toLocaleString("en-US", { minimumFractionDigits: frac ? 2 : 0, maximumFractionDigits: 2 });
 }
 function money(v, cur){ return cur === "LKR" ? fmtLkr(v) : inr(v); }
 function curSymbol(cur){ return cur === "LKR" ? "Rs" : "₹"; }
@@ -284,6 +285,17 @@ function billSharesPaise(b){
       var part = allocatePaise(round2(item.amount), iw);
       Object.keys(part).forEach(function(e){ sum[e] = (sum[e]||0) + part[e]; });
     });
+    // Service charge, tax, discount…: each is split in proportion to what
+    // each person's items came to, not equally.
+    if(Array.isArray(b.extras) && b.extras.length){
+      var base = {};
+      Object.keys(sum).forEach(function(e){ base[e] = sum[e]; });
+      b.extras.forEach(function(x){
+        var part = allocatePaise(round2(x.amount), base);
+        var sign = x.kind === "discount" ? -1 : 1;
+        Object.keys(part).forEach(function(e){ sum[e] = (sum[e]||0) + sign*part[e]; });
+      });
+    }
     return sum;
   }
   if(b.splitMode === "exact" && b.splitAmounts){
@@ -397,7 +409,21 @@ function validateBillCore(payload, peopleEmails){
       total = round2(total+iamt);
     }
     if(!allPeople.length) throw new Error("Pick at least one person across the line items.");
-    return { desc:desc, amount:total, category:category, paidBy:paidBy, split:allPeople, splitMode:"itemized", items:items };
+    var extras = [], charges = 0, discounts = 0;
+    ((payload && payload.extras) || []).forEach(function(x){
+      var xd = cleanText(x && x.desc, MAX_DESC_LEN) || (x && x.kind === "discount" ? "Discount" : "Tax / service");
+      var xa = round2(x && x.amount);
+      if(!isFinite(xa) || xa <= 0) return;                     // blank extra rows are just skipped
+      var kind = x.kind === "discount" ? "discount" : "charge";
+      var ex = { desc: xd, amount: xa, kind: kind };
+      if(x.pct != null && isFinite(Number(x.pct)) && Number(x.pct) > 0) ex.pct = Math.round(Number(x.pct)*100)/100;
+      extras.push(ex);
+      if(kind === "discount") discounts = round2(discounts + xa); else charges = round2(charges + xa);
+    });
+    if(discounts > total) throw new Error("The discount is more than the items cost — check the amounts.");
+    var grand = round2(total + charges - discounts);
+    if(!(grand > 0)) throw new Error("The bill total has to be more than zero.");
+    return { desc:desc, amount:grand, category:category, paidBy:paidBy, split:allPeople, splitMode:"itemized", items:items, extras:extras };
   }
 
   var amount = round2(payload && payload.amount);
@@ -472,8 +498,18 @@ function validateBill(payload, peopleEmails){
       inrTotal = round2(inrTotal + inrAmt);
       return Object.assign({}, it, { origAmount: it.amount, amount: inrAmt });
     });
+    var sign = 0;
+    out.extras = (out.extras || []).map(function(x){
+      var inrAmt = lkrToInr(x.amount, rate);
+      if(!(inrAmt > 0)) throw new Error('"'+x.desc+'" is too small to convert to ₹.');
+      sign = x.kind === "discount" ? -1 : 1;
+      origTotal = round2(origTotal + sign*x.amount);
+      inrTotal = round2(inrTotal + sign*inrAmt);
+      return Object.assign({}, x, { origAmount: x.amount, amount: inrAmt });
+    });
     out.origAmount = origTotal;
     out.amount = inrTotal;
+    if(!(inrTotal > 0)) throw new Error("The bill total has to be more than zero.");
   } else {
     out.origAmount = out.amount;
     out.amount = lkrToInr(out.amount, rate);
@@ -545,6 +581,16 @@ function cleanStoredItem(it){
   return out;
 }
 
+function cleanStoredExtra(x){
+  if(!x || typeof x !== "object") return null;
+  var amount = Number(x.amount);
+  if(!isFinite(amount) || amount <= 0) return null;
+  var out = { desc: cleanText(x.desc, MAX_DESC_LEN), amount: round2(amount), kind: x.kind === "discount" ? "discount" : "charge" };
+  var orig = Number(x.origAmount); if(isFinite(orig) && orig > 0) out.origAmount = round2(orig);
+  var pct = Number(x.pct); if(isFinite(pct) && pct > 0) out.pct = pct;
+  return out;
+}
+
 function rebuildState(){
   var peopleSnap = latestSnapshots.people;
   var billsSnap = latestSnapshots.bills;
@@ -609,6 +655,7 @@ function rebuildState(){
       splitAmounts: d.splitAmounts || null,
       splitShares: d.splitShares || null,
       items: Array.isArray(d.items) ? d.items.map(cleanStoredItem).filter(Boolean) : null,
+      extras: Array.isArray(d.extras) ? d.extras.map(cleanStoredExtra).filter(Boolean) : null,
       currency: d.currency === "LKR" ? "LKR" : "INR",
       origAmount: (d.currency === "LKR" && Number(d.origAmount) > 0) ? Number(d.origAmount) : null,
       fx: (d.currency === "LKR" && d.fx && validRate(d.fx.rate)) ? d.fx : null,
@@ -965,6 +1012,7 @@ function addBill(payload){
       splitAmounts: bill.splitAmounts || null,
       splitShares: bill.splitShares || null,
       items: bill.items || null,
+      extras: bill.extras && bill.extras.length ? bill.extras : null,
       currency: bill.currency, origAmount: bill.origAmount, fx: bill.fx, billDate: bill.billDate,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
@@ -985,6 +1033,7 @@ function updateBill(id, payload){
       splitAmounts: bill.splitAmounts || null,
       splitShares: bill.splitShares || null,
       items: bill.items || null,
+      extras: bill.extras && bill.extras.length ? bill.extras : null,
       currency: bill.currency, origAmount: bill.origAmount, fx: bill.fx, billDate: bill.billDate,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     });
@@ -1460,7 +1509,7 @@ function viewBills(){
     var splitTxt;
     if(b.splitMode==="itemized"){
       var n = (b.items||[]).length;
-      splitTxt = n+" item"+(n===1?"":"s")+" · "+b.split.length+" people";
+      splitTxt = n+" item"+(n===1?"":"s")+" · "+b.split.length+" people"+((b.extras||[]).length ? " · tax shared by item" : "");
     } else {
       splitTxt = (b.split.length===S.people.length && S.people.length>0)
         ? "split with everyone" : ("split "+b.split.length+" way"+(b.split.length===1?"":"s"));
@@ -1732,72 +1781,214 @@ function loadTesseract(){
   return tesseractLoadPromise;
 }
 
-/** Lines that summarise the bill rather than being something someone ate or
-    bought. Shown in the review list but NOT pre-selected, otherwise the
-    total gets added as an extra "item" and the bill doubles. */
-var RECEIPT_SUMMARY_RE = /\b(sub\s*-?\s*total|total|grand|net\s*amount|amount\s*due|balance|cash|change|tender(ed)?|paid|card|visa|master|amex|upi|round(ing)?\s*off)\b/i;
+/* ---- Reading receipt text ----
+   Every priced line becomes one of:
+     item     — something someone ate/bought
+     charge   — service charge, VAT, tax, SSCL, tip… (shared in proportion to items)
+     discount — discount, offer, promo… (shared in proportion to items)
+     ignore   — sub-total, total, cash, change, card, table/bill numbers…
+   The person reviews and fixes everything before it's used. */
+var RECEIPT_TOTAL_RE    = /\b(grand\s*total|net\s*total|total(\s*(amount|payable|due|lkr|rs|inr))?|amount\s*(due|payable)|net\s*amount|bill\s*amount)\b/i;
+var RECEIPT_SUBTOTAL_RE = /\b(sub\s*-?\s*tot(al)?|gross(\s*amount)?)\b/i;
+var RECEIPT_IGNORE_RE   = /\b(cash|change|tender(ed)?|paid|card|visa|master(card)?|amex|upi|balance|round(ing)?\s*off|items?\s*count|no\.?\s*of\s*items|qty\s*total)\b/i;
+var RECEIPT_CHARGE_RE   = /\b(service|svc|s\/c|sc|tax|vat|gst|sscl|cess|levy|tip|gratuity|delivery|packing|packaging|container|cover\s*charge)\b/i;
+var RECEIPT_DISCOUNT_RE = /\b(discount|disc|less|offer|promo|coupon|voucher|deduction)\b/i;
+var RECEIPT_META_RE     = /\b(table(?!\s*water)|bill\s*no|no\s*[:.#]|invoice|order\s*(no|#)|kot|token|tel|phone|mob(ile)?)\b/i;
+var RECEIPT_HEADER_RE   = /^(table|tbl|tel|phone|ph|mob|date|time|bill\s*no|invoice|inv|order|receipt|guest|pax|covers?|cashier|server|waiter|steward|token|kot|gst\s*no|vat\s*(reg|no)|tin|reg)\b(?!\s*water)/i;
 
-/** Header/footer lines with a number at the end (table no., phone, bill no.)
-    — shown unticked, not dropped, since "Table water 150" is a real item. */
-var RECEIPT_HEADER_RE = /^(table|tbl|tel|phone|ph|date|time|bill\s*no|invoice|inv|order|receipt|guest|pax|covers?|cashier|server|waiter|steward|token|kot|gst|vat\s*reg)\b(?!\s*water)/i;
+/** Tidies the end of an OCR'd line so the price can be read:
+    "10 ,942-98" → "10,942.98", "g 010.90" → "9,010.90", "-500 .00" → "-500.00",
+    trailing "|" and stray symbols removed, O→0 inside numbers. */
+function tidyReceiptLine(line){
+  var s = String(line).replace(/[|¦`'"_~]+\s*$/g, "").replace(/\s*\/\s*[-=]+\s*$/, "").replace(/\s+$/, "");
+  var m = /^(.*?)([-(]?\s*(?:₹|rs\.?|lkr|inr)?\s*[0-9OoSgB,.\s-]*[0-9][0-9OoSgB,.\s-]*\)?)$/i.exec(s);
+  if(!m) return s;
+  var head = m[1], tail = m[2];
+  if(!/\d/.test(tail)) return s;
+  var fixed = tail
+    .replace(/(^|[\s,.(-])[gB](?=\s*\d)/g, function(_, p){ return p + "9"; })     // g 010 → 9 010 (OCR 9)
+    .replace(/(\d)\s*[Oo]|[Oo]\s*(?=\d)/g, function(x){ return x.replace(/[Oo]/g, "0"); })
+    .replace(/(\d)\s*S(?=\d)/g, "$15")
+    .replace(/(\d)\s+([.,])\s*(\d)/g, "$1$2$3")
+    .replace(/(\d)([.,])\s+(\d)/g, "$1$2$3")
+    .replace(/(\d)-(\d{2})\s*\)?$/, "$1.$2");                                  // 942-98 → 942.98
+  // Note: "1 950.00" is left alone on purpose — that's a quantity column
+  // next to the price, not a broken "1,950.00".
+  return head + fixed;
+}
 
-/** Parses raw OCR text into candidate {desc, amount} lines: any line ending in
-    a plausible price. Handles 1200, 1,200, 1,200.00 and 1200.50 (the old
-    pattern read "1200" as 200). Pure on-device heuristic — the person
-    confirms in the review step. */
+function parseReceiptNumber(str){
+  var t = String(str).replace(/\s/g, "");
+  // "1.234,50" (European) → 1234.50 ; "1,234.50" → 1234.50 ; "450,00" → 450.00
+  if(/^\d{1,3}(\.\d{3})+,\d{1,2}$/.test(t)) t = t.replace(/\./g, "").replace(",", ".");
+  else if(/^\d+,\d{2}$/.test(t)) t = t.replace(",", ".");
+  else t = t.replace(/,/g, "");
+  return parseFloat(t);
+}
+
 function parseReceiptLines(rawText){
-  var lines = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/\s+/g," ").trim(); }).filter(function(l){ return l.length>1; });
-  var priceRe = /(?:₹|rs\.?|lkr|inr)?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:\.\d{1,2})?)\s*$/i;
-  var out = [];
-  lines.forEach(function(line){
+  var raw = String(rawText||"").split(/\r?\n/).map(function(l){ return l.trim(); }).filter(function(l){ return l.length > 1; });
+  var priceRe = /(-|\()?\s*(?:₹|rs\.?|lkr|inr)?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*\)?\s*$/i;
+  var out = [], pendingName = "";
+  var receiptTotal = null, receiptSubtotal = null;
+
+  raw.forEach(function(orig){
+    var line = tidyReceiptLine(orig).replace(/\s+/g, " ").trim();
     var m = priceRe.exec(line);
-    if(!m) return;
-    var amount = round2(parseFloat(m[1].replace(/,/g,"")));
-    if(!isFinite(amount) || amount<=0 || amount>MAX_AMOUNT) return;
-    var desc = cleanText(line.slice(0, m.index).replace(/(₹|rs\.?|lkr|inr)\s*$/i,""), MAX_DESC_LEN);
-    if(!desc || !/[a-z]/i.test(desc)) return;           // bare numbers: dates, phone, table no.
-    if(/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}:\d{2}\s*$/.test(desc)) return; // "Date 20/11/2026 21:14"
-    out.push({ desc:desc, amount:amount, summary: RECEIPT_SUMMARY_RE.test(desc) || RECEIPT_HEADER_RE.test(desc) });
+    if(!m){
+      // A name on its own line whose price is on the next line.
+      pendingName = /[a-z]{3,}/i.test(line) && !RECEIPT_HEADER_RE.test(line) ? line : "";
+      return;
+    }
+    var amount = round2(parseReceiptNumber(m[2]));
+    if(!isFinite(amount) || amount <= 0 || amount > MAX_AMOUNT){ pendingName = ""; return; }
+    var negative = !!m[1];
+    var desc = line.slice(0, m.index).replace(/(₹|rs\.?|lkr|inr)\s*$/i, "").trim();
+
+    // Quantity columns: "Kottu 2 2,400.00", "Tea 2 x 150 300", "2 x Tea 300"
+    var qty = 0, q;
+    if((q = /\s(\d{1,3})\s*[xX@*]\s*[\d.,]+\s*$/.exec(" "+desc))){ qty = +q[1]; desc = (" "+desc).slice(0, q.index).trim(); }
+    else if((q = /\s(\d{1,2})(?:\s*(?:nos?|pcs?|x))?\s*$/i.exec(" "+desc)) && /[a-z]/i.test(desc.slice(0, desc.length - q[0].length + 1))){ qty = +q[1]; desc = (" "+desc).slice(0, q.index).trim(); }
+    if((q = /^(\d{1,2})\s*[xX]?\s+(?=[a-z])/i.exec(desc))){ qty = qty || +q[1]; desc = desc.slice(q[0].length); }
+
+    desc = desc.replace(/[\s:.\-–=\\\/|]+$/, "").replace(/^[^a-z0-9(]+/i, "");
+    if(!/[a-z]/i.test(desc)){
+      if(pendingName){ desc = pendingName; }
+      else { pendingName = ""; return; }                      // bare numbers
+    }
+    pendingName = "";
+    if(/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}:\d{2}\s*$/.test(desc)) return;   // dates/times
+    desc = cleanText(desc, MAX_DESC_LEN);
+
+    var kind = "item";
+    if(RECEIPT_SUBTOTAL_RE.test(desc)){ kind = "ignore"; receiptSubtotal = amount; }
+    else if(RECEIPT_TOTAL_RE.test(desc)){ kind = "ignore"; receiptTotal = amount; }
+    else if(RECEIPT_IGNORE_RE.test(desc) || RECEIPT_HEADER_RE.test(desc) || RECEIPT_META_RE.test(desc)) kind = "ignore";
+    else if(RECEIPT_DISCOUNT_RE.test(desc) || negative) kind = "discount";
+    else if(RECEIPT_CHARGE_RE.test(desc)) kind = "charge";
+
+    var pct = /(\d{1,2}(?:\.\d{1,2})?)\s*%/.exec(desc);
+    out.push({ desc: desc, amount: amount, kind: kind, qty: qty > 1 ? qty : 0, pct: pct ? +pct[1] : null });
   });
+
+  // Once the grand total is found, anything after it (cash, change, loyalty
+  // points…) isn't part of the bill.
+  var lastTotalIdx = -1;
+  out.forEach(function(c, i){ if(c.kind === "ignore" && RECEIPT_TOTAL_RE.test(c.desc) && !RECEIPT_SUBTOTAL_RE.test(c.desc)) lastTotalIdx = i; });
+  if(lastTotalIdx >= 0) out.forEach(function(c, i){ if(i > lastTotalIdx && c.kind !== "ignore") c.kind = "ignore"; });
+
+  out.receiptTotal = receiptTotal;
+  out.receiptSubtotal = receiptSubtotal;
   return out;
 }
 
 /** First line that looks like a shop name (letters, no price) — usually the
     restaurant/shop printed at the top of the receipt. */
 function guessReceiptTitle(rawText){
-  var ls = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/\s+/g," ").trim(); });
+  var ls = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/[|]/g,"").replace(/\s+/g," ").trim(); });
   for(var i=0; i<Math.min(ls.length, 6); i++){
     var l = ls[i];
     if(l.length < 3 || l.length > 40) continue;
     if(!/[a-z]{3,}/i.test(l)) continue;
-    if(/\d{3,}/.test(l)) continue;                       // phone numbers, prices
-    if(RECEIPT_HEADER_RE.test(l) || RECEIPT_SUMMARY_RE.test(l)) continue;
+    if(/\d{3,}/.test(l)) continue;
+    if(RECEIPT_HEADER_RE.test(l) || RECEIPT_TOTAL_RE.test(l) || RECEIPT_IGNORE_RE.test(l)) continue;
     return cleanText(l.toLowerCase().replace(/\b\w/g, function(c){ return c.toUpperCase(); }), MAX_DESC_LEN);
   }
   return "";
 }
 
-/** Shrinks big phone photos (12MP+) to ~1600px and greyscales them before
-    OCR — several times faster on a phone and usually more accurate. */
-function prepareReceiptImage(file){
-  return new Promise(function(resolve){
-    var url = URL.createObjectURL(file);
-    var img = new Image();
-    img.onload = function(){
-      try{
-        var max = 1600, w = img.naturalWidth, h = img.naturalHeight;
-        var k = Math.min(1, max / Math.max(w, h));
-        var c = document.createElement("canvas");
-        c.width = Math.round(w*k); c.height = Math.round(h*k);
-        var ctx = c.getContext("2d");
-        ctx.filter = "grayscale(1) contrast(1.25)";
-        ctx.drawImage(img, 0, 0, c.width, c.height);
-        URL.revokeObjectURL(url);
-        resolve(c);
-      } catch(e){ URL.revokeObjectURL(url); resolve(file); }
-    };
-    img.onerror = function(){ URL.revokeObjectURL(url); resolve(file); };
+/* ---- Photo clean-up before OCR ----
+   1. Find the white receipt paper in the photo and crop to it (a receipt
+      that's small in the frame is otherwise unreadable).
+   2. Scale so the receipt is ~1600px wide. (The old code shrank the LONG
+      side to 1600px, which made tall receipts too narrow to read.)
+   3. Even out shadows/uneven light (divide by a blurred copy), greyscale,
+      and stretch contrast. */
+function loadImageEl(file){
+  return new Promise(function(resolve, reject){
+    var url = URL.createObjectURL(file), img = new Image();
+    img.onload = function(){ resolve({ img:img, url:url }); };
+    img.onerror = function(){ URL.revokeObjectURL(url); reject(new Error("Couldn't open that photo")); };
     img.src = url;
+  });
+}
+
+function findPaperBox(img){
+  var s = 400 / Math.max(img.naturalWidth, img.naturalHeight);
+  var w = Math.max(8, Math.round(img.naturalWidth * s)), h = Math.max(8, Math.round(img.naturalHeight * s));
+  var c = document.createElement("canvas"); c.width = w; c.height = h;
+  var ctx = c.getContext("2d"); ctx.drawImage(img, 0, 0, w, h);
+  var d = ctx.getImageData(0, 0, w, h).data, g = new Float32Array(w*h), sum = 0, sum2 = 0;
+  for(var i=0, p=0; i<d.length; i+=4, p++){ var v = 0.299*d[i] + 0.587*d[i+1] + 0.114*d[i+2]; g[p] = v; sum += v; sum2 += v*v; }
+  var n = w*h, mean = sum/n, sd = Math.sqrt(Math.max(0, sum2/n - mean*mean));
+  var sorted = Array.prototype.slice.call(g).sort(function(a,b){ return a-b; });
+  var thr = Math.max(sorted[Math.floor(n*0.6)], mean + 0.35*sd);
+  var colFrac = new Float32Array(w), rowFrac = new Float32Array(h);
+  for(var y=0; y<h; y++) for(var x=0; x<w; x++) if(g[y*w+x] > thr){ colFrac[x]++; rowFrac[y]++; }
+  var x0=-1, x1=-1, y0=-1, y1=-1;
+  for(x=0; x<w; x++) if(colFrac[x]/h > 0.25){ if(x0<0) x0 = x; x1 = x; }
+  for(y=0; y<h; y++) if(rowFrac[y]/w > 0.15){ if(y0<0) y0 = y; y1 = y; }
+  if(x0 < 0 || y0 < 0 || x1-x0 < 10 || y1-y0 < 10) return null;
+  var pad = 6; x0 = Math.max(0, x0-pad); y0 = Math.max(0, y0-pad); x1 = Math.min(w-1, x1+pad); y1 = Math.min(h-1, y1+pad);
+  if((x1-x0)*(y1-y0) > 0.85*w*h) return null;              // already fills the photo
+  return { x: x0/s, y: y0/s, w: (x1-x0+1)/s, h: (y1-y0+1)/s };
+}
+
+function prepareReceiptImage(file){
+  return loadImageEl(file).then(function(o){
+    var img = o.img;
+    try{
+      var box = findPaperBox(img) || { x:0, y:0, w:img.naturalWidth, h:img.naturalHeight };
+      // A colour copy of just the receipt, for checking against in the review.
+      var preview = o.url;
+      try{
+        var pk = Math.min(1, 900 / box.w), pc = document.createElement("canvas");
+        pc.width = Math.max(1, Math.round(box.w*pk)); pc.height = Math.max(1, Math.round(box.h*pk));
+        pc.getContext("2d").drawImage(img, box.x, box.y, box.w, box.h, 0, 0, pc.width, pc.height);
+        preview = pc.toDataURL("image/jpeg", 0.82);
+        URL.revokeObjectURL(o.url);
+      }catch(e){}
+      var k = 1600 / box.w;
+      if(box.w*box.h*k*k > 6e6) k = Math.sqrt(6e6 / (box.w*box.h));
+      var W = Math.max(1, Math.round(box.w*k)), H = Math.max(1, Math.round(box.h*k));
+      var c = document.createElement("canvas"); c.width = W; c.height = H;
+      var ctx = c.getContext("2d");
+      ctx.imageSmoothingQuality = "high";
+      ctx.drawImage(img, box.x, box.y, box.w, box.h, 0, 0, W, H);
+      var id = ctx.getImageData(0, 0, W, H), d = id.data, N = W*H;
+      var g = new Uint8ClampedArray(N);
+      for(var i=0, p=0; p<N; i+=4, p++) g[p] = (77*d[i] + 150*d[i+1] + 29*d[i+2]) >> 8;
+      // integral image for a fast box blur (background estimate)
+      var I = new Uint32Array((W+1)*(H+1));
+      for(var y=1; y<=H; y++){
+        var row = 0;
+        for(var x=1; x<=W; x++){ row += g[(y-1)*W + (x-1)]; I[y*(W+1)+x] = I[(y-1)*(W+1)+x] + row; }
+      }
+      var r = Math.max(8, Math.round(W/64)), norm = new Float32Array(N), hist = new Uint32Array(256);
+      for(y=0; y<H; y++){
+        var ya = Math.max(0, y-r), yb = Math.min(H, y+r+1);
+        for(x=0; x<W; x++){
+          var xa = Math.max(0, x-r), xb = Math.min(W, x+r+1);
+          var area = (yb-ya)*(xb-xa);
+          var bsum = I[yb*(W+1)+xb] - I[ya*(W+1)+xb] - I[yb*(W+1)+xa] + I[ya*(W+1)+xa];
+          var v = Math.min(255, g[y*W+x] / (bsum/area + 1) * 255 * 0.92);
+          norm[y*W+x] = v; hist[v|0]++;
+        }
+      }
+      var lo = 0, hi = 255, acc = 0;
+      for(var t=0; t<256; t++){ acc += hist[t]; if(acc >= N*0.02){ lo = t; break; } }
+      acc = 0;
+      for(t=255; t>=0; t--){ acc += hist[t]; if(acc >= N*0.02){ hi = t; break; } }
+      var span = Math.max(1, hi - lo);
+      for(i=0, p=0; p<N; i+=4, p++){
+        var o2 = Math.max(0, Math.min(255, (norm[p]-lo)/span*255));
+        d[i] = d[i+1] = d[i+2] = o2; d[i+3] = 255;
+      }
+      ctx.putImageData(id, 0, 0);
+      return { canvas: c, photoUrl: preview };
+    } catch(e){
+      return { canvas: img, photoUrl: o.url };
+    }
   });
 }
 
@@ -1806,22 +1997,31 @@ function scanReceiptImage(file, btn){
   function progress(txt){ if(btn) btn.textContent = txt; }
   if(btn) btn.disabled = true;
   progress("Loading scanner…");
+  var prepared = null;
   return loadTesseract().then(function(){
     progress("Preparing photo…");
     return prepareReceiptImage(file);
-  }).then(function(img){
-    return Tesseract.recognize(img, "eng", {
+  }).then(function(p){
+    prepared = p;
+    return Tesseract.createWorker("eng", 1, {
       logger: function(m){
         if(m && m.status === "recognizing text") progress("Reading… " + Math.round((m.progress||0)*100) + "%");
         else if(m && /load/i.test(m.status||"")) progress("Loading scanner…");
       }
     });
+  }).then(function(worker){
+    // Receipts are one column of left/right-aligned text: "single block"
+    // mode reads them far better than automatic layout detection.
+    return worker.setParameters({ tessedit_pageseg_mode: "6", preserve_interword_spaces: "1" })
+      .then(function(){ return worker.recognize(prepared.canvas); })
+      .then(function(res){ worker.terminate(); return res; }, function(err){ worker.terminate(); throw err; });
   }).then(function(result){
     if(btn){ btn.disabled = false; progress(label); }
     var text = result && result.data && result.data.text || "";
     var lines = parseReceiptLines(text);
     lines.title = guessReceiptTitle(text);
     lines.lkr = /\bLKR\b|රු/i.test(text);
+    lines.photoUrl = prepared.photoUrl;
     return lines;
   }).catch(function(err){
     if(btn){ btn.disabled = false; progress(label); }
@@ -1829,53 +2029,115 @@ function scanReceiptImage(file, btn){
   });
 }
 
-function openReceiptReviewSheet(candidates, onConfirm, onBack){
-  var picked = candidates.map(function(c){ return !c.summary; });
+var RC_KINDS = ["item","charge","discount","ignore"];
+var RC_LABEL = { item:"Item", charge:"+ Tax / svc", discount:"− Discount", ignore:"Skip" };
 
-  function renderList(){
-    return candidates.map(function(c, i){
-      return '<div class="split-row">'+
-        '<div class="chip'+(picked[i]?" on":"")+'" data-role="cand-toggle" data-idx="'+i+'" style="flex:1;text-align:left;display:flex;justify-content:space-between;gap:8px;">'+
-          '<span>'+esc(c.desc)+(c.summary?' <span class="muted" style="font-weight:500;">· total line</span>':'')+'</span>'+
-          '<span>'+money(c.amount, draftCurrency)+'</span></div>'+
-      '</div>';
-    }).join("");
+function openReceiptReviewSheet(candidates, onConfirm, onBack){
+  var receiptTotal = candidates.receiptTotal != null ? candidates.receiptTotal : null;
+  var receiptSubtotal = candidates.receiptSubtotal != null ? candidates.receiptSubtotal : null;
+  var totalIdx = -1;
+  candidates.forEach(function(c, i){
+    if(c.kind === "ignore" && RECEIPT_TOTAL_RE.test(c.desc) && !RECEIPT_SUBTOTAL_RE.test(c.desc) && c.amount === receiptTotal) totalIdx = i;
+  });
+  var rows = candidates.map(function(c, i){
+    return { desc: c.desc + (c.qty ? " ×" + c.qty : ""), amount: c.amount, kind: c.kind, pct: c.pct, isTotal: i === totalIdx };
+  });
+  var cur = draftCurrency;
+
+  function sums(){
+    var t = { item:0, charge:0, discount:0 };
+    rows.forEach(function(r){ var v = Number(r.amount)||0; if(t[r.kind] != null) t[r.kind] = round2(t[r.kind] + v); });
+    t.total = round2(t.item + t.charge - t.discount);
+    return t;
   }
-  function pickedSum(){ return candidates.reduce(function(s,c,i){ return s + (picked[i]?c.amount:0); }, 0); }
+  function rowHtml(r, i){
+    if(r.isTotal){
+      return '<div class="rc-row rc-total">'+
+        '<span class="rc-kind rc-kind-total">Receipt total</span>'+
+        '<input type="text" class="split-input rc-desc" value="'+esc(r.desc)+'" disabled>'+
+        '<input type="number" inputmode="decimal" class="split-input rc-amt" data-role="rc-amt" data-i="'+i+'" value="'+esc(r.amount)+'">'+
+      '</div>';
+    }
+    return '<div class="rc-row rc-'+r.kind+'">'+
+      '<button class="rc-kind" data-role="rc-kind" data-i="'+i+'">'+RC_LABEL[r.kind]+'</button>'+
+      '<input type="text" class="split-input rc-desc" data-role="rc-desc" data-i="'+i+'" value="'+esc(r.desc)+'" maxlength="80">'+
+      '<input type="number" inputmode="decimal" class="split-input rc-amt" data-role="rc-amt" data-i="'+i+'" value="'+esc(r.amount)+'">'+
+    '</div>';
+  }
+  function summaryHtml(){
+    var t = sums();
+    var h = '<div class="bd-line"><span>Items</span><span>'+esc(money(t.item, cur))+'</span></div>';
+    if(t.charge) h += '<div class="bd-line"><span>Tax / service</span><span>+ '+esc(money(t.charge, cur))+'</span></div>';
+    if(t.discount) h += '<div class="bd-line"><span>Discount</span><span>− '+esc(money(t.discount, cur))+'</span></div>';
+    h += '<div class="bd-line bd-total"><span>Total</span><span>'+esc(money(t.total, cur))+'</span></div>';
+    if(receiptSubtotal != null){
+      var sd = round2(t.item - receiptSubtotal);
+      if(Math.abs(sd) >= 1) h += '<div class="bd-check bad">Items add up to '+esc(money(t.item, cur))+' but the receipt sub-total says '+esc(money(receiptSubtotal, cur))+' — an item price is probably misread.</div>';
+      else h += '<div class="bd-check ok">✓ Items match the receipt sub-total</div>';
+    }
+    if(receiptTotal != null){
+      var diff = round2(t.total - receiptTotal);
+      h += Math.abs(diff) < 1 ? '<div class="bd-check ok">✓ Matches the receipt total ('+esc(money(receiptTotal, cur))+')</div>'
+        : '<div class="bd-check bad">Receipt total reads '+esc(money(receiptTotal, cur))+' — off by '+esc(money(Math.abs(diff), cur))+'. Check the amounts against the photo.</div>';
+    }
+    return h;
+  }
 
   openSheetHtml(
-    '<h3>Receipt scanned</h3>'+
-    '<p class="muted" style="font-size:13px;line-height:1.5;margin-top:-8px;">Tap lines to keep or drop them. Total/cash/change lines start unticked so nothing is counted twice. Check amounts against the paper receipt.</p>'+
-    '<div id="cand-list">'+renderList()+'</div>'+
-    '<div class="split-hint" id="cand-sum"></div>'+
+    '<h3>Check the receipt</h3>'+
+    (candidates.photoUrl ? '<img class="rc-photo" id="rc-photo" src="'+esc(candidates.photoUrl)+'" alt="Receipt photo">'+
+      '<div class="muted" style="font-size:11.5px;margin:4px 0 10px;text-align:center;">Tap the photo to enlarge</div>' : '')+
+    '<p class="muted" style="font-size:12.5px;line-height:1.5;margin:0 0 10px;">Fix any name or amount the scanner got wrong. Tap the label to switch a line between <b>Item</b>, <b>Tax / service</b>, <b>Discount</b> or <b>Skip</b>.</p>'+
+    '<div id="rc-list"></div>'+
+    '<button class="btn btn-ghost btn-sm" id="rc-add" style="margin:4px 0 10px;">+ Add a missed line</button>'+
+    '<div class="breakdown" id="rc-sum"></div>'+
     '<div class="sheet-actions">'+
       '<button class="btn btn-ghost" id="cand-back">Back</button>'+
-      '<button class="btn btn-brand" id="cand-add">Add selected</button>'+
+      '<button class="btn btn-brand" id="cand-add">Add to bill</button>'+
     '</div>',
     function(el){
-      function refresh(){
-        el.querySelector("#cand-list").innerHTML = renderList();
-        el.querySelector("#cand-sum").textContent = "Selected: " + money(pickedSum(), draftCurrency);
-        wire();
-      }
-      function wire(){
-        el.querySelectorAll('[data-role="cand-toggle"]').forEach(function(c){
-          c.addEventListener("click", function(){
-            var i = parseInt(c.dataset.idx,10);
-            picked[i] = !picked[i];
-            refresh();
+      function refreshSum(){ el.querySelector("#rc-sum").innerHTML = summaryHtml(); }
+      function renderRows(){
+        el.querySelector("#rc-list").innerHTML = rows.map(rowHtml).join("");
+        el.querySelectorAll('[data-role="rc-kind"]').forEach(function(b){
+          b.addEventListener("click", function(){
+            var r = rows[+b.dataset.i];
+            r.kind = RC_KINDS[(RC_KINDS.indexOf(r.kind) + 1) % RC_KINDS.length];
+            renderRows();
           });
         });
+        el.querySelectorAll('[data-role="rc-desc"]').forEach(function(i){
+          i.addEventListener("input", function(){ rows[+i.dataset.i].desc = i.value; });
+        });
+        el.querySelectorAll('[data-role="rc-amt"]').forEach(function(i){
+          i.addEventListener("input", function(){
+            var r = rows[+i.dataset.i];
+            r.amount = parseFloat(i.value) || 0;
+            if(r.isTotal) receiptTotal = r.amount || null;   // correcting a misread total
+            refreshSum();
+          });
+        });
+        refreshSum();
       }
-      refresh();
+      renderRows();
+      var ph = el.querySelector("#rc-photo");
+      if(ph) ph.addEventListener("click", function(){ ph.classList.toggle("big"); });
+      el.querySelector("#rc-add").addEventListener("click", function(){
+        rows.push({ desc:"", amount:"", kind:"item", pct:null });
+        renderRows();
+        var ins = el.querySelectorAll('[data-role="rc-desc"]'); if(ins.length) ins[ins.length-1].focus();
+      });
       el.querySelector("#cand-back").addEventListener("click", function(){ closeSheet(); if(onBack) onBack(); });
       el.querySelector("#cand-add").addEventListener("click", function(){
-        var chosen = candidates.filter(function(c,i){ return picked[i]; });
+        var ok = rows.filter(function(r){ return !r.isTotal && r.kind !== "ignore" && Number(r.amount) > 0 && String(r.desc).trim(); });
+        var items = ok.filter(function(r){ return r.kind === "item"; }).map(function(r){ return { desc: cleanText(r.desc, MAX_DESC_LEN), amount: round2(r.amount) }; });
+        if(!items.length){ toast("Mark at least one line as an Item", true); return; }
+        var extras = ok.filter(function(r){ return r.kind !== "item"; }).map(function(r){ return { desc: cleanText(r.desc, MAX_DESC_LEN), amount: round2(r.amount), kind: r.kind, pct: r.pct }; });
         closeSheet();
-        onConfirm(chosen);
+        onConfirm({ items: items, extras: extras, receiptTotal: receiptTotal });
       });
     },
-    onBack   // tapping outside the sheet also goes back to the bill, not into the void
+    onBack
   );
 }
 
@@ -1885,6 +2147,14 @@ var draftSplit = [], draftPaidBy = "", draftCat = "other", draftMode = "equal";
 var draftAmounts = {}, draftShares = {};
 var draftItems = []; // itemized mode: [{ localId, desc, amount, people:[email], mode:"equal"|"percent", percents:{} }]
 var draftItemSeq = 0;
+// Tax / service / discount lines on an itemized bill, in the bill's currency.
+// mode "amount": value is the amount; mode "percent": value is % of the items subtotal.
+var draftExtras = [], draftExtraSeq = 0, draftReceiptTotal = null;
+function newDraftExtra(desc, kind, mode, value, pct){
+  draftExtraSeq++;
+  return { localId:"x"+draftExtraSeq, desc:desc||"", kind: kind === "discount" ? "discount" : "charge",
+           mode: mode === "percent" ? "percent" : "amount", value: value || "", pct: pct != null ? pct : null };
+}
 var draftDesc = "";
 var draftAmountText = null;   // typed amount kept across a receipt scan
 var draftCurrency = "INR", draftBillDate = "", draftFx = { rate:null, source:"day", date:null };
@@ -1919,6 +2189,12 @@ function openBillSheet(existing, resumeDraft, autoScan){
       var shown = (draftCurrency === "LKR" && Number(it.origAmount) > 0) ? Number(it.origAmount) : it.amount;
       return { localId:"it"+draftItemSeq, desc:it.desc, amount:shown, people:(it.people||[]).slice(), mode:it.mode||"equal", percents:Object.assign({},it.percents||{}) };
     }) : [];
+    draftExtraSeq = 0;
+    draftExtras = (existing && existing.extras) ? existing.extras.map(function(x){
+      var shown = (draftCurrency === "LKR" && Number(x.origAmount) > 0) ? Number(x.origAmount) : x.amount;
+      return newDraftExtra(x.desc, x.kind, "amount", shown, x.pct);
+    }) : [];
+    draftReceiptTotal = null;
   }
   /** Formats an amount in the bill's own currency (what's being typed). */
   function cm(v){ return money(v, draftCurrency); }
@@ -1959,6 +2235,52 @@ function openBillSheet(existing, resumeDraft, autoScan){
   }
 
   function itemTotal(){ return round2(draftItems.reduce(function(s,it){ return s+(Number(it.amount)||0); },0)); }
+  function extraAmount(x){
+    var v = Number(x.value) || 0;
+    return round2(x.mode === "percent" ? itemTotal() * v / 100 : v);
+  }
+  function resolvedExtras(){
+    return draftExtras.map(function(x){
+      return { desc: x.desc, kind: x.kind, amount: extraAmount(x), pct: x.mode === "percent" ? Number(x.value)||null : x.pct };
+    }).filter(function(x){ return x.amount > 0; });
+  }
+  function grandTotal(){
+    return round2(resolvedExtras().reduce(function(s,x){ return s + (x.kind === "discount" ? -x.amount : x.amount); }, itemTotal()));
+  }
+  /** Per-person amounts (bill currency) using the exact same maths as the balances. */
+  function draftPerPerson(){
+    var tmp = { splitMode:"itemized", items: draftItems.filter(function(it){ return Number(it.amount) > 0 && it.people.length; }).map(function(it){
+      return { amount: round2(it.amount), people: it.people, mode: it.mode, percents: it.percents };
+    }), extras: resolvedExtras() };
+    var p = billSharesPaise(tmp), out = {};
+    Object.keys(p).forEach(function(e){ out[e] = p[e]/100; });
+    return out;
+  }
+  function renderExtrasSection(){
+    var rows = draftExtras.map(function(x){
+      var isD = x.kind === "discount";
+      return '<div class="x-row" data-extra="'+x.localId+'">'+
+        '<div style="display:flex;gap:6px;align-items:center;">'+
+          '<button class="chip x-kind'+(isD?' disc':'')+'" data-role="x-kind" data-x="'+x.localId+'">'+(isD ? "− Discount" : "+ Tax / service")+'</button>'+
+          '<input type="text" class="split-input" data-role="x-desc" data-x="'+x.localId+'" style="flex:1;min-width:0;" maxlength="80" value="'+esc(x.desc)+'" placeholder="'+(isD?"Discount":"Service charge / VAT")+'">'+
+          '<button class="btn btn-line btn-sm" data-role="x-del" data-x="'+x.localId+'" style="padding:6px 9px;">✕</button>'+
+        '</div>'+
+        '<div style="display:flex;gap:6px;align-items:center;margin-top:6px;">'+
+          '<input type="number" inputmode="decimal" class="split-input" data-role="x-val" data-x="'+x.localId+'" style="width:124px;" value="'+esc(x.value)+'" placeholder="'+(x.mode==="percent"?"%":"0")+'">'+
+          '<button class="btn btn-ghost btn-sm" data-role="x-mode" data-x="'+x.localId+'" style="padding:6px 10px;">'+(x.mode==="percent" ? "% of items" : "amount")+'</button>'+
+          '<span class="muted" data-role="x-res" data-x="'+x.localId+'" style="font-size:12.5px;margin-left:auto;"></span>'+
+        '</div>'+
+      '</div>';
+    }).join("");
+    return '<div class="extras-box">'+
+      '<div class="extras-head">Tax, service &amp; discounts</div>'+
+      '<div class="muted" style="font-size:12px;margin:-2px 0 8px;">Shared in proportion to what each person had — not split equally.</div>'+
+      rows+
+      '<div style="display:flex;gap:8px;margin-top:6px;">'+
+        '<button class="btn btn-ghost btn-sm" id="b-add-charge">+ Tax / service</button>'+
+        '<button class="btn btn-ghost btn-sm" id="b-add-discount">− Discount</button>'+
+      '</div></div>';
+  }
 
   function renderItemsSection(){
     if(!draftItems.length){
@@ -1989,7 +2311,8 @@ function openBillSheet(existing, resumeDraft, autoScan){
         '<div style="margin-top:8px;">'+modeToggle+'</div>'+
         percentRow+
       '</div>';
-    }).join("") + '<div class="split-hint" id="b-items-total" style="margin-top:4px;"></div>';
+    }).join("") + renderExtrasSection() +
+      '<div class="breakdown" id="b-items-total"></div>';
   }
 
   // Firestore rules only let the person who added a bill change or delete it.
@@ -2041,14 +2364,46 @@ function openBillSheet(existing, resumeDraft, autoScan){
       var fxStatus = validRate(draftFx.rate) ? "ok" : "none";
 
       function updateConv(){
-        var total = draftMode === "itemized" ? itemTotal() : amt();
+        var total = draftMode === "itemized" ? grandTotal() : amt();
+        // ₹ shown = sum of each line converted, exactly as it will be saved.
+        var inrTotal = null;
+        if(draftCurrency === "LKR" && validRate(draftFx.rate)){
+          if(draftMode === "itemized"){
+            inrTotal = draftItems.reduce(function(s,it){ return round2(s + (Number(it.amount) > 0 ? lkrToInr(it.amount, draftFx.rate) : 0)); }, 0);
+            resolvedExtras().forEach(function(x){ inrTotal = round2(inrTotal + (x.kind==="discount" ? -1 : 1) * lkrToInr(x.amount, draftFx.rate)); });
+          } else inrTotal = lkrToInr(total, draftFx.rate);
+        }
         var txt = "";
         if(draftCurrency === "LKR"){
-          txt = validRate(draftFx.rate) ? ("= " + inr(lkrToInr(total, draftFx.rate)) + " at ₹1 = " + draftFx.rate + " LKR") : "Waiting for the exchange rate…";
+          txt = inrTotal != null ? ("= " + inr(inrTotal) + " at ₹1 = " + draftFx.rate + " LKR") : "Waiting for the exchange rate…";
         }
         var c = el.querySelector("#b-conv"); if(c) c.textContent = txt;
         var t = el.querySelector("#b-items-total");
-        if(t) t.textContent = "Items total: " + cm(total) + (draftCurrency === "LKR" && validRate(draftFx.rate) ? "  (= " + inr(lkrToInr(total, draftFx.rate)) + ")" : "");
+        if(t && draftMode === "itemized"){
+          var sub = itemTotal(), ex = resolvedExtras(), html = '<div class="bd-line"><span>Items</span><span>'+esc(cm(sub))+'</span></div>';
+          ex.forEach(function(x){
+            html += '<div class="bd-line"><span>'+esc(x.desc || (x.kind==="discount"?"Discount":"Tax / service"))+'</span><span>'+(x.kind==="discount"?"− ":"+ ")+esc(cm(x.amount))+'</span></div>';
+          });
+          html += '<div class="bd-line bd-total"><span>Total</span><span>'+esc(cm(total))+
+            (inrTotal != null ? ' <span class="muted" style="font-weight:500;">= '+esc(inr(inrTotal))+'</span>' : '')+'</span></div>';
+          if(draftReceiptTotal != null){
+            var diff = round2(total - draftReceiptTotal);
+            html += Math.abs(diff) < 1
+              ? '<div class="bd-check ok">✓ Matches the receipt total</div>'
+              : '<div class="bd-check bad">Receipt total reads '+esc(cm(draftReceiptTotal))+' — '+esc(cm(Math.abs(diff)))+(diff>0?' more':' less')+' here. Check the lines against the paper.</div>';
+          }
+          var per = draftPerPerson(), names = Object.keys(per).filter(function(e){ return per[e] > 0; });
+          if(names.length){
+            html += '<div class="bd-head">Each person pays</div>' + names.map(function(e){
+              return '<div class="bd-line"><span>'+esc(pName(e))+'</span><span>'+esc(cm(per[e]))+'</span></div>';
+            }).join("");
+          }
+          t.innerHTML = html;
+          draftExtras.forEach(function(x){
+            var r = el.querySelector('[data-role="x-res"][data-x="'+x.localId+'"]');
+            if(r) r.textContent = x.mode === "percent" ? "= " + cm(extraAmount(x)) : "";
+          });
+        }
       }
 
       function updateFxUI(){
@@ -2153,7 +2508,25 @@ function openBillSheet(existing, resumeDraft, autoScan){
         updateConv();
       }
 
+      function findX(id){ return draftExtras.filter(function(x){ return x.localId === id; })[0]; }
+      function wireExtras(){
+        el.querySelectorAll('[data-role="x-kind"]').forEach(function(b){ b.addEventListener("click", function(){
+          var x = findX(b.dataset.x); if(!x) return; x.kind = x.kind === "discount" ? "charge" : "discount"; rebuildItemsSection(); }); });
+        el.querySelectorAll('[data-role="x-mode"]').forEach(function(b){ b.addEventListener("click", function(){
+          var x = findX(b.dataset.x); if(!x) return; x.mode = x.mode === "percent" ? "amount" : "percent"; x.value = ""; rebuildItemsSection(); }); });
+        el.querySelectorAll('[data-role="x-del"]').forEach(function(b){ b.addEventListener("click", function(){
+          draftExtras = draftExtras.filter(function(x){ return x.localId !== b.dataset.x; }); rebuildItemsSection(); }); });
+        el.querySelectorAll('[data-role="x-desc"]').forEach(function(i){ i.addEventListener("input", function(){
+          var x = findX(i.dataset.x); if(x){ x.desc = i.value; updateConv(); } }); });
+        el.querySelectorAll('[data-role="x-val"]').forEach(function(i){ i.addEventListener("input", function(){
+          var x = findX(i.dataset.x); if(x){ x.value = i.value; updateConv(); } }); });
+        var ac = el.querySelector("#b-add-charge"), ad = el.querySelector("#b-add-discount");
+        if(ac) ac.addEventListener("click", function(){ draftExtras.push(newDraftExtra("Service charge", "charge", "percent", "")); rebuildItemsSection(); });
+        if(ad) ad.addEventListener("click", function(){ draftExtras.push(newDraftExtra("Discount", "discount", "amount", "")); rebuildItemsSection(); });
+      }
+
       function wireItemsSection(){
+        wireExtras();
         el.querySelectorAll('[data-role="item-desc"]').forEach(function(inp){
           inp.addEventListener("input", function(){
             var it = draftItems.filter(function(x){return x.localId===inp.dataset.item;})[0];
@@ -2195,6 +2568,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
             if(!it) return;
             it.percents[inp.dataset.id] = parseFloat(inp.value)||0;
             var sumPct = 0; it.people.forEach(function(e){ sumPct += Number(it.percents[e])||0; });
+            updateConv();
             var hintEl = el.querySelector('[data-item-card="'+it.localId+'"] .split-hint');
             if(hintEl){
               hintEl.textContent = Math.round(sumPct*100)/100 + '% of ' + cm(it.amount) + (Math.abs(sumPct-100) <= 0.5 ? " ✓" : " — needs to total 100%");
@@ -2301,14 +2675,16 @@ function openBillSheet(existing, resumeDraft, autoScan){
           var existingSnapshot = existing;
           var prevCurrency = draftCurrency;
           if(lines.lkr) draftCurrency = "LKR";   // so the review list shows LKR
-          openReceiptReviewSheet(lines, function(picked){
+          openReceiptReviewSheet(lines, function(res){
             draftMode = "itemized";
             // Drop blank placeholder rows so they don't block saving.
             draftItems = draftItems.filter(function(it){ return String(it.desc).trim() || Number(it.amount) > 0; });
-            picked.forEach(function(p){ draftItems.push(newDraftItem(p.desc, p.amount)); });
+            res.items.forEach(function(p){ draftItems.push(newDraftItem(p.desc, p.amount)); });
+            res.extras.forEach(function(x){ draftExtras.push(newDraftExtra(x.desc, x.kind, "amount", x.amount, x.pct)); });
+            draftReceiptTotal = res.receiptTotal;
             if(!draftDesc.trim()) draftDesc = lines.title || "Receipt";
             openBillSheet(existingSnapshot, true);
-            toast(picked.length+" item"+(picked.length===1?"":"s")+" added — now tap who had each one");
+            toast(res.items.length+" item"+(res.items.length===1?"":"s")+" added — now tap who had each one");
           }, function(){
             draftCurrency = prevCurrency;   // Back: nothing about the bill changes
             openBillSheet(existingSnapshot, true);
@@ -2348,7 +2724,8 @@ function openBillSheet(existing, resumeDraft, autoScan){
           payload.items = draftItems.map(function(it){
             return { desc:it.desc, amount:it.amount, people:it.people.slice(), mode:it.mode, percents:Object.assign({},it.percents) };
           });
-          payload.amount = itemTotal(); // for the description-required check below only
+          payload.extras = resolvedExtras();
+          payload.amount = grandTotal(); // for the quick checks below; validateBill recomputes it
         } else {
           payload.amount = parseFloat(el.querySelector("#b-amount").value);
           payload.split = draftSplit.slice();
