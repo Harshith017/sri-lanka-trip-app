@@ -1788,97 +1788,194 @@ function loadTesseract(){
      discount — discount, offer, promo… (shared in proportion to items)
      ignore   — sub-total, total, cash, change, card, table/bill numbers…
    The person reviews and fixes everything before it's used. */
-var RECEIPT_TOTAL_RE    = /\b(grand\s*total|net\s*total|total(\s*(amount|payable|due|lkr|rs|inr))?|amount\s*(due|payable)|net\s*amount|bill\s*amount)\b/i;
-var RECEIPT_SUBTOTAL_RE = /\b(sub\s*-?\s*tot(al)?|gross(\s*amount)?)\b/i;
-var RECEIPT_IGNORE_RE   = /\b(cash|change|tender(ed)?|paid|card|visa|master(card)?|amex|upi|balance|round(ing)?\s*off|items?\s*count|no\.?\s*of\s*items|qty\s*total)\b/i;
-var RECEIPT_CHARGE_RE   = /\b(service|svc|s\/c|sc|tax|vat|gst|sscl|cess|levy|tip|gratuity|delivery|packing|packaging|container|cover\s*charge)\b/i;
+var RECEIPT_TOTAL_RE    = /\b(grand\s*t[o0]t\w*|net\s*t[o0]t\w*|t[o0]ta[l1I|\]]?(\s*(amount|payable|due|lkr|rs|inr))?|amount\s*(due|payable)|net\s*amount|bill\s*amount|net\s*payable)(?![a-z])/i;
+var RECEIPT_SUBTOTAL_RE = /\b(sub\s*-?\s*t[o0]t\w*|gross(\s*amount)?|taxable\s*(amount|value))/i;
+var RECEIPT_IGNORE_RE   = /\b(cash|change|tender(ed)?|paid|card|visa|master(card)?|amex|upi|balance|round(ing)?\s*off|items?\s*count|no\.?\s*of\s*items|qty\s*total|gstin|fssai|pax)\b/i;
+var RECEIPT_CHARGE_RE   = /\b(service|svc|s\/c|sc|tax|vat|gst|cgst|sgst|igst|utgst|sscl|cess|levy|tip|gratuity|delivery|packing|packaging|container|cover\s*charge)\b/i;
 var RECEIPT_DISCOUNT_RE = /\b(discount|disc|less|offer|promo|coupon|voucher|deduction)\b/i;
-var RECEIPT_META_RE     = /\b(table(?!\s*water)|bill\s*no|no\s*[:.#]|invoice|order\s*(no|#)|kot|token|tel|phone|mob(ile)?)\b/i;
-var RECEIPT_HEADER_RE   = /^(table|tbl|tel|phone|ph|mob|date|time|bill\s*no|invoice|inv|order|receipt|guest|pax|covers?|cashier|server|waiter|steward|token|kot|gst\s*no|vat\s*(reg|no)|tin|reg)\b(?!\s*water)/i;
+var RECEIPT_META_RE     = /\b(table(?!\s*water)|bill\s*no|no\s*[:.#]|invoice|order\s*(no|#)|kot|token|tel|phone|mob(ile)?|dine\s*in|take\s*away|captain|manager|cashier|steward)\b/i;
+var RECEIPT_HEADER_RE   = /^(table|tbl|tel|phone|ph|mob|date|time|bill\s*no|invoice|inv|order|receipt|guest|pax|covers?|cashier|server|waiter|steward|token|kot|gst\s*no|gstin|fssai|vat\s*(reg|no)|tin|reg)\b(?!\s*water)/i;
+var RECEIPT_NOTE_RE     = /^\s*(note|notes|nb|remark|remarks|instruction|comment)s?\s*[:\-]/i;
 
-/** Tidies the end of an OCR'd line so the price can be read:
-    "10 ,942-98" → "10,942.98", "g 010.90" → "9,010.90", "-500 .00" → "-500.00",
-    trailing "|" and stray symbols removed, O→0 inside numbers. */
+/** Fixes common OCR slips at the end of a line so the price can be read:
+    "10 ,942-98" → "10,942.98", "g 010.90" → "9 010.90", "-500 .00" → "-500.00",
+    "450/=" → "450", trailing "|" removed, O→0 next to digits. */
 function tidyReceiptLine(line){
-  var s = String(line).replace(/[|¦`'"_~]+\s*$/g, "").replace(/\s*\/\s*[-=]+\s*$/, "").replace(/\s+$/, "");
+  var s = String(line).replace(/[|¦`'"_~;:]+\s*$/g, "").replace(/\s*\/\s*[-=]+\s*$/, "").replace(/\s+$/, "");
   var m = /^(.*?)([-(]?\s*(?:₹|rs\.?|lkr|inr)?\s*[0-9OoSgB,.\s-]*[0-9][0-9OoSgB,.\s-]*\)?)$/i.exec(s);
   if(!m) return s;
   var head = m[1], tail = m[2];
   if(!/\d/.test(tail)) return s;
   var fixed = tail
-    .replace(/(^|[\s,.(-])[gB](?=\s*\d)/g, function(_, p){ return p + "9"; })     // g 010 → 9 010 (OCR 9)
+    .replace(/(^|[\s,.(-])[gB](?=\s*\d)/g, function(_, p){ return p + "9"; })
     .replace(/(\d)\s*[Oo]|[Oo]\s*(?=\d)/g, function(x){ return x.replace(/[Oo]/g, "0"); })
     .replace(/(\d)\s*S(?=\d)/g, "$15")
-    .replace(/(\d)\s+([.,])\s*(\d)/g, "$1$2$3")
-    .replace(/(\d)([.,])\s+(\d)/g, "$1$2$3")
-    .replace(/(\d)-(\d{2})\s*\)?$/, "$1.$2");                                  // 942-98 → 942.98
-  // Note: "1 950.00" is left alone on purpose — that's a quantity column
-  // next to the price, not a broken "1,950.00".
+    .replace(/(\d) ?([.,]) ?(\d)/g, "$1$2$3")
+    .replace(/(\d)-(\d{2})\s*\)?$/, "$1.$2");
   return head + fixed;
 }
 
 function parseReceiptNumber(str){
   var t = String(str).replace(/\s/g, "");
-  // "1.234,50" (European) → 1234.50 ; "1,234.50" → 1234.50 ; "450,00" → 450.00
   if(/^\d{1,3}(\.\d{3})+,\d{1,2}$/.test(t)) t = t.replace(/\./g, "").replace(",", ".");
   else if(/^\d+,\d{2}$/.test(t)) t = t.replace(",", ".");
   else t = t.replace(/,/g, "");
   return parseFloat(t);
 }
 
-function parseReceiptLines(rawText){
-  var raw = String(rawText||"").split(/\r?\n/).map(function(l){ return l.trim(); }).filter(function(l){ return l.length > 1; });
-  var priceRe = /(-|\()?\s*(?:₹|rs\.?|lkr|inr)?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*\)?\s*$/i;
-  var out = [], pendingName = "";
-  var receiptTotal = null, receiptSubtotal = null;
+/** One column cell → number, or null if it isn't one. Knows the usual OCR
+    confusions for a lone "1" (I, l, |, i) and "2 960.00" split thousands. */
+function receiptCellNumber(cell){
+  var c = String(cell).trim().replace(/^[₹]|^(rs\.?|lkr|inr)\s*/i, "");
+  if(/^[Il|i!\]\[]$/.test(c)) return 1;
+  c = c.replace(/^(\d{1,3}) (\d{3}(?:[.,]\d{1,2})?)$/, "$1,$2");       // "2 960.00"
+  if(!/^[-(]?\d[\d,]*(?:\.\d{1,2})?\)?$/.test(c)) return null;
+  var neg = /^[-(]/.test(c);
+  var v = parseReceiptNumber(c.replace(/[()-]/g, ""));
+  return isFinite(v) ? (neg ? -v : v) : null;
+}
 
-  raw.forEach(function(orig){
-    var line = tidyReceiptLine(orig).replace(/\s+/g, " ").trim();
-    var m = priceRe.exec(line);
-    if(!m){
-      // A name on its own line whose price is on the next line.
-      pendingName = /[a-z]{3,}/i.test(line) && !RECEIPT_HEADER_RE.test(line) ? line : "";
-      return;
-    }
-    var amount = round2(parseReceiptNumber(m[2]));
-    if(!isFinite(amount) || amount <= 0 || amount > MAX_AMOUNT){ pendingName = ""; return; }
-    var negative = !!m[1];
-    var desc = line.slice(0, m.index).replace(/(₹|rs\.?|lkr|inr)\s*$/i, "").trim();
-
-    // Quantity columns: "Kottu 2 2,400.00", "Tea 2 x 150 300", "2 x Tea 300"
-    var qty = 0, q;
-    if((q = /\s(\d{1,3})\s*[xX@*]\s*[\d.,]+\s*$/.exec(" "+desc))){ qty = +q[1]; desc = (" "+desc).slice(0, q.index).trim(); }
-    else if((q = /\s(\d{1,2})(?:\s*(?:nos?|pcs?|x))?\s*$/i.exec(" "+desc)) && /[a-z]/i.test(desc.slice(0, desc.length - q[0].length + 1))){ qty = +q[1]; desc = (" "+desc).slice(0, q.index).trim(); }
-    if((q = /^(\d{1,2})\s*[xX]?\s+(?=[a-z])/i.exec(desc))){ qty = qty || +q[1]; desc = desc.slice(q[0].length); }
-
-    desc = desc.replace(/[\s:.\-–=\\\/|]+$/, "").replace(/^[^a-z0-9(]+/i, "");
-    if(!/[a-z]/i.test(desc)){
-      if(pendingName){ desc = pendingName; }
-      else { pendingName = ""; return; }                      // bare numbers
-    }
-    pendingName = "";
-    if(/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}:\d{2}\s*$/.test(desc)) return;   // dates/times
-    desc = cleanText(desc, MAX_DESC_LEN);
-
-    var kind = "item";
-    if(RECEIPT_SUBTOTAL_RE.test(desc)){ kind = "ignore"; receiptSubtotal = amount; }
-    else if(RECEIPT_TOTAL_RE.test(desc)){ kind = "ignore"; receiptTotal = amount; }
-    else if(RECEIPT_IGNORE_RE.test(desc) || RECEIPT_HEADER_RE.test(desc) || RECEIPT_META_RE.test(desc)) kind = "ignore";
-    else if(RECEIPT_DISCOUNT_RE.test(desc) || negative) kind = "discount";
-    else if(RECEIPT_CHARGE_RE.test(desc)) kind = "charge";
-
-    var pct = /(\d{1,2}(?:\.\d{1,2})?)\s*%/.exec(desc);
-    out.push({ desc: desc, amount: amount, kind: kind, qty: qty > 1 ? qty : 0, pct: pct ? +pct[1] : null });
+/** Cleans an item name: drops stray OCR marks from ruled lines, fixes "]"
+    at the end of a word (usually an "l": "Bage]" → "Bagel"). */
+function cleanReceiptName(parts){
+  var cells = parts.map(function(x){ return String(x).trim(); }).filter(function(x){
+    if(!x) return false;
+    var letters = (x.match(/[a-z]/ig) || []).length;
+    return letters >= 3 || (letters >= 2 && x.length <= 4 && /^[A-Z]{2,4}$/.test(x)) || /\d/.test(x) && letters >= 1;
   });
+  var name = cells.join(" ").replace(/\](?=\s|$)/g, "l").replace(/\s+/g, " ").trim();
+  return name.replace(/^[^a-z0-9(&']+/i, "").replace(/[\s:.\-–=\\\/|,;]+$/, "");
+}
 
-  // Once the grand total is found, anything after it (cash, change, loyalty
-  // points…) isn't part of the bill.
-  var lastTotalIdx = -1;
-  out.forEach(function(c, i){ if(c.kind === "ignore" && RECEIPT_TOTAL_RE.test(c.desc) && !RECEIPT_SUBTOTAL_RE.test(c.desc)) lastTotalIdx = i; });
-  if(lastTotalIdx >= 0) out.forEach(function(c, i){ if(i > lastTotalIdx && c.kind !== "ignore") c.kind = "ignore"; });
+function classifyReceiptLine(desc, negative){
+  if(RECEIPT_SUBTOTAL_RE.test(desc)) return "subtotal";
+  if(RECEIPT_TOTAL_RE.test(desc)) return "total";
+  if(RECEIPT_IGNORE_RE.test(desc) || RECEIPT_HEADER_RE.test(desc) || RECEIPT_META_RE.test(desc)) return "ignore";
+  if(RECEIPT_DISCOUNT_RE.test(desc) || negative) return "discount";
+  if(RECEIPT_CHARGE_RE.test(desc)) return "charge";
+  return "item";
+}
+
+/** Reads the receipt text into lines the person can check.
+    - Skips everything above the "Item / Qty / Rate / Amount" header
+      (shop name, address, GSTIN, phone, table/pax…).
+    - Reads columns (OCR keeps them 2+ spaces apart), so qty and rate never
+      end up in the item name, and flags lines where qty × rate ≠ amount.
+    - Names that wrap onto the next line are joined back; ₹0 add-ons
+      ("Scrambled", "Pineapple") are attached to the item above; "note:"
+      lines are dropped.
+    - Stops at the grand total (cash, change etc. are ignored). */
+function parseReceiptLines(rawText){
+  var raw = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/\s+$/,""); }).filter(function(l){ return l.trim().length > 1; });
+  var out = [], receiptTotal = null, receiptSubtotal = null, expectedItems = null;
+
+  // Find the column header and anything useful above it.
+  var start = 0;
+  for(var h = 0; h < raw.length; h++){
+    var hl = raw[h];
+    var cnt = /(\d{1,3})\s*items?\b/i.exec(hl);
+    if(cnt && expectedItems == null) expectedItems = +cnt[1];
+    if(/\b(qty|quantity|qnty)\b/i.test(hl) && /\b(amount|amt|total|price|rate|value)\b/i.test(hl) && !/\d{3,}/.test(hl)){ start = h + 1; break; }
+    if(/\b(item|items|description|particulars|name)\b/i.test(hl) && /\b(amount|amt|price)\b/i.test(hl) && !/\d{3,}/.test(hl)){ start = h + 1; break; }
+  }
+
+  var pending = [];                          // text-only lines waiting to be placed
+  var lastItem = null, done = false;
+  function flushToLast(){
+    if(lastItem && pending.length) lastItem.desc = cleanText(lastItem.desc + " " + pending.join(" "), MAX_DESC_LEN);
+    pending = [];
+  }
+
+  for(var i = start; i < raw.length && !done; i++){
+    var orig = raw[i];
+    if(RECEIPT_NOTE_RE.test(orig.replace(/^[^a-z]*/i, ""))) continue;          // "note: welldone"
+    if(/^[\s\-=_*.~—–]+$/.test(orig)) { flushToLast(); continue; }            // ruled line
+
+    var line = tidyReceiptLine(orig);
+    var cells = line.split(/\s{2,}|\s*\|\s*/).map(function(c){ return c.trim(); }).filter(function(c){ return c && !/^[^\w₹()-]+$/.test(c); });
+    // Trailing numeric cells = [qty] [rate] amount
+    var nums = [];
+    while(cells.length && receiptCellNumber(cells[cells.length-1]) !== null && nums.length < 3){
+      nums.unshift(receiptCellNumber(cells.pop()));
+    }
+    // Single-space OCR (no column gaps): fall back to "name … 123.45" at the end.
+    if(!nums.length && cells.length){
+      var m = /(-|\()?\s*(?:₹|rs\.?|lkr|inr)?\s*(\d{1,3}(?:,\d{3})+(?:\.\d{1,2})?|\d+(?:[.,]\d{1,2})?)\s*\)?\s*$/i.exec(cells[cells.length-1]);
+      if(m && m.index > 0){
+        var v = parseReceiptNumber(m[2]);
+        cells[cells.length-1] = cells[cells.length-1].slice(0, m.index);
+        nums = [m[1] ? -v : v];
+        var qm;
+        var lc = cells[cells.length-1];
+        if((qm = /\s(\d{1,3}|[Il|])\s*[xX@*]\s*([\d.,]+)\s*$/.exec(" "+lc)) || (qm = /\s(\d{1,3}|[Il|])\s+([\d.,]+)\s*$/.exec(" "+lc))){ nums.unshift(receiptCellNumber(qm[1]), receiptCellNumber(qm[2])); cells[cells.length-1] = (" "+lc).slice(0, qm.index); }
+        else if((qm = /\s(\d{1,2}|[Il|])\s*[xX@*]?\s*$/.exec(" "+lc)) && /[a-z]{2}/i.test(lc)){ nums.unshift(receiptCellNumber(qm[1])); cells[cells.length-1] = (" "+lc).slice(0, qm.index); }
+      }
+    }
+    var name = cleanReceiptName(cells);
+    var qx;
+    if((qx = /^(\d{1,2})\s*[xX]?\s+(?=[a-z])/i.exec(name))){ nums.unshift(+qx[1]); name = name.slice(qx[0].length); }   // "2 x Tea"
+
+    if(!nums.length){
+      // Text only: part of a wrapped name, or a name whose price is below.
+      if(name && /[a-z]{3,}/i.test(name) && !RECEIPT_HEADER_RE.test(name) && !RECEIPT_META_RE.test(name)) pending.push(name);
+      continue;
+    }
+
+    var amount = round2(Math.abs(nums[nums.length-1]));
+    var negative = nums[nums.length-1] < 0 || /^\s*\(/.test(orig.slice(-12)) || /-\s*[\d.,]+\s*$/.test(line);
+    if(!isFinite(amount) || amount > MAX_AMOUNT){ pending = []; continue; }
+    if(/\d{1,2}[\/.\-]\d{1,2}[\/.\-]\d{2,4}|\d{1,2}:\d{2}/.test(orig) && !/[a-z]{4,}.*\d+\.\d{2}\s*$/i.test(orig)) { pending = []; continue; }
+
+    // A ₹0 line is an add-on/choice for the item above ("Scrambled", "Pineapple").
+    if(amount === 0){
+      var mod = pending.length ? pending.pop() : name;
+      flushToLast();
+      if(lastItem && mod && /[a-z]{3,}/i.test(mod)) lastItem.desc = cleanText(lastItem.desc + " (" + mod + ")", MAX_DESC_LEN);
+      continue;
+    }
+
+    if(!/[a-z]{2,}/i.test(name)){
+      if(pending.length){ name = pending.join(" "); pending = []; }     // name was on the line(s) above
+      else continue;                                                    // bare numbers
+    }
+    var kind = classifyReceiptLine(name, negative);
+    if(kind === "item") flushToLast(); else { flushToLast(); }
+
+    var qty = 0, warn = false;
+    if(nums.length >= 3){
+      qty = nums[nums.length-3];
+      var rate = nums[nums.length-2];
+      if(qty > 0 && rate > 0 && Math.abs(qty*rate - amount) > 1) warn = true;
+    } else if(nums.length === 2 && Number.isInteger(nums[0]) && nums[0] > 0 && nums[0] <= 99 && nums[0] !== amount){
+      qty = nums[0];
+    }
+
+    name = cleanText(name.replace(/\s+on\s+[\d,]+(\.\d+)?\s*$/i, ""), MAX_DESC_LEN);   // "10% on 2,960.00"
+    var pct = /(\d{1,2}(?:\.\d{1,2})?)\s*%/.exec(name);
+    if(pct && kind !== "item") name = name.slice(0, pct.index + pct[0].length);             // drop OCR junk after "10%"
+
+    if(kind === "subtotal"){ receiptSubtotal = amount; out.push({ desc:name, amount:amount, kind:"ignore", qty:0, pct:null }); lastItem = null; continue; }
+    if(kind === "total"){ receiptTotal = amount; out.push({ desc:name, amount:amount, kind:"ignore", qty:0, pct:null }); lastItem = null; done = true; continue; }
+
+    // Tax/service printed as a % of the sub-total: if the amount OCR'd doesn't
+    // fit, use the worked-out amount instead and flag it for checking.
+    if((kind === "charge" || kind === "discount") && pct && receiptSubtotal){
+      var expected = round2(receiptSubtotal * (+pct[1]) / 100);
+      // Only step in when the reading is wildly off (tax is often charged on a
+      // different base, so a modest difference is normal and left alone).
+      if(expected > 0 && (amount < expected*0.25 || amount > expected*4)){ amount = expected; warn = true; }
+    }
+    if(kind !== "item" && amount < 1) continue;
+    var row = { desc: name, amount: amount, kind: kind, qty: qty > 1 ? qty : 0, pct: pct ? +pct[1] : null, warn: warn };
+    out.push(row);
+    lastItem = kind === "item" ? row : null;
+  }
+  flushToLast();
 
   out.receiptTotal = receiptTotal;
   out.receiptSubtotal = receiptSubtotal;
+  out.expectedItems = expectedItems;
+  out.headerFound = start > 0;
   return out;
 }
 
@@ -1890,7 +1987,8 @@ function guessReceiptTitle(rawText){
     var l = ls[i];
     if(l.length < 3 || l.length > 40) continue;
     if(!/[a-z]{3,}/i.test(l)) continue;
-    if(/\d{3,}/.test(l)) continue;
+    if(/\d{5,}|@|www\.|\.com|\.club|\.lk|\.in\b/i.test(l)) continue;          // phone, pincode, email, web
+    if((l.match(/[a-z]/ig) || []).length / l.length < 0.55) continue;            // mostly OCR noise
     if(RECEIPT_HEADER_RE.test(l) || RECEIPT_TOTAL_RE.test(l) || RECEIPT_IGNORE_RE.test(l)) continue;
     return cleanText(l.toLowerCase().replace(/\b\w/g, function(c){ return c.toUpperCase(); }), MAX_DESC_LEN);
   }
@@ -1929,8 +2027,12 @@ function findPaperBox(img){
   for(x=0; x<w; x++) if(colFrac[x]/h > 0.25){ if(x0<0) x0 = x; x1 = x; }
   for(y=0; y<h; y++) if(rowFrac[y]/w > 0.15){ if(y0<0) y0 = y; y1 = y; }
   if(x0 < 0 || y0 < 0 || x1-x0 < 10 || y1-y0 < 10) return null;
-  var pad = 6; x0 = Math.max(0, x0-pad); y0 = Math.max(0, y0-pad); x1 = Math.min(w-1, x1+pad); y1 = Math.min(h-1, y1+pad);
-  if((x1-x0)*(y1-y0) > 0.85*w*h) return null;              // already fills the photo
+  // Only crop when the receipt is small in the photo. If it already fills
+  // most of the frame, keep everything — a shadowed or curled edge can look
+  // like background and cropping would cut letters off the item names.
+  if((x1-x0+1)*(y1-y0+1) > 0.5*w*h) return null;
+  var px = Math.round(w*0.06), py = Math.round(h*0.04);
+  x0 = Math.max(0, x0-px); y0 = Math.max(0, y0-py); x1 = Math.min(w-1, x1+px); y1 = Math.min(h-1, y1+py);
   return { x: x0/s, y: y0/s, w: (x1-x0+1)/s, h: (y1-y0+1)/s };
 }
 
@@ -1985,7 +2087,12 @@ function prepareReceiptImage(file){
         d[i] = d[i+1] = d[i+2] = o2; d[i+3] = 255;
       }
       ctx.putImageData(id, 0, 0);
-      return { canvas: c, photoUrl: preview };
+      var M = 48, bc = document.createElement("canvas");
+      bc.width = W + 2*M; bc.height = H + 2*M;
+      var bctx = bc.getContext("2d");
+      bctx.fillStyle = "#fff"; bctx.fillRect(0, 0, bc.width, bc.height);
+      bctx.drawImage(c, M, M);
+      return { canvas: bc, photoUrl: preview };
     } catch(e){
       return { canvas: img, photoUrl: o.url };
     }
@@ -2040,8 +2147,9 @@ function openReceiptReviewSheet(candidates, onConfirm, onBack){
     if(c.kind === "ignore" && RECEIPT_TOTAL_RE.test(c.desc) && !RECEIPT_SUBTOTAL_RE.test(c.desc) && c.amount === receiptTotal) totalIdx = i;
   });
   var rows = candidates.map(function(c, i){
-    return { desc: c.desc + (c.qty ? " ×" + c.qty : ""), amount: c.amount, kind: c.kind, pct: c.pct, isTotal: i === totalIdx };
+    return { desc: c.desc + (c.qty ? " ×" + c.qty : ""), amount: c.amount, kind: c.kind, pct: c.pct, warn: !!c.warn, isTotal: i === totalIdx };
   });
+  var showSkipped = false;
   var cur = draftCurrency;
 
   function sums(){
@@ -2058,15 +2166,21 @@ function openReceiptReviewSheet(candidates, onConfirm, onBack){
         '<input type="number" inputmode="decimal" class="split-input rc-amt" data-role="rc-amt" data-i="'+i+'" value="'+esc(r.amount)+'">'+
       '</div>';
     }
-    return '<div class="rc-row rc-'+r.kind+'">'+
+    if(r.kind === "ignore" && !showSkipped && !r.userSkipped) return "";
+    return '<div class="rc-row rc-'+r.kind+(r.warn ? ' rc-warn' : '')+'">'+
       '<button class="rc-kind" data-role="rc-kind" data-i="'+i+'">'+RC_LABEL[r.kind]+'</button>'+
       '<input type="text" class="split-input rc-desc" data-role="rc-desc" data-i="'+i+'" value="'+esc(r.desc)+'" maxlength="80">'+
       '<input type="number" inputmode="decimal" class="split-input rc-amt" data-role="rc-amt" data-i="'+i+'" value="'+esc(r.amount)+'">'+
-    '</div>';
+    '</div>'+
+    (r.warn ? '<div class="rc-warn-note">⚠ Check this amount against the photo'+(r.kind === "item" ? ' — qty × rate didn\'t match' : ' — worked out from the %')+'</div>' : '');
   }
   function summaryHtml(){
     var t = sums();
-    var h = '<div class="bd-line"><span>Items</span><span>'+esc(money(t.item, cur))+'</span></div>';
+    var nItems = rows.filter(function(r){ return r.kind === "item" && Number(r.amount) > 0; }).length;
+    var h = '<div class="bd-line"><span>Items ('+nItems+')</span><span>'+esc(money(t.item, cur))+'</span></div>';
+    if(candidates.expectedItems) h += nItems === candidates.expectedItems
+      ? '<div class="bd-check ok">✓ '+nItems+' items — same as the receipt says</div>'
+      : '<div class="bd-check bad">Receipt says '+candidates.expectedItems+' items, '+nItems+' found here — something may be missing or split.</div>';
     if(t.charge) h += '<div class="bd-line"><span>Tax / service</span><span>+ '+esc(money(t.charge, cur))+'</span></div>';
     if(t.discount) h += '<div class="bd-line"><span>Discount</span><span>− '+esc(money(t.discount, cur))+'</span></div>';
     h += '<div class="bd-line bd-total"><span>Total</span><span>'+esc(money(t.total, cur))+'</span></div>';
@@ -2098,11 +2212,16 @@ function openReceiptReviewSheet(candidates, onConfirm, onBack){
     function(el){
       function refreshSum(){ el.querySelector("#rc-sum").innerHTML = summaryHtml(); }
       function renderRows(){
-        el.querySelector("#rc-list").innerHTML = rows.map(rowHtml).join("");
+        var nSkipped = rows.filter(function(r){ return r.kind === "ignore" && !r.isTotal && !r.userSkipped; }).length;
+        el.querySelector("#rc-list").innerHTML = rows.map(rowHtml).join("") +
+          (nSkipped ? '<button class="rc-toggle" id="rc-toggle">'+(showSkipped ? "Hide" : "Show")+' '+nSkipped+' skipped line'+(nSkipped===1?"":"s")+'</button>' : '');
+        var tg = el.querySelector("#rc-toggle");
+        if(tg) tg.addEventListener("click", function(){ showSkipped = !showSkipped; renderRows(); });
         el.querySelectorAll('[data-role="rc-kind"]').forEach(function(b){
           b.addEventListener("click", function(){
             var r = rows[+b.dataset.i];
             r.kind = RC_KINDS[(RC_KINDS.indexOf(r.kind) + 1) % RC_KINDS.length];
+            if(r.kind === "ignore") r.userSkipped = true;   // stays visible so it can be switched back
             renderRows();
           });
         });
@@ -2112,6 +2231,7 @@ function openReceiptReviewSheet(candidates, onConfirm, onBack){
         el.querySelectorAll('[data-role="rc-amt"]').forEach(function(i){
           i.addEventListener("input", function(){
             var r = rows[+i.dataset.i];
+            r.warn = false;
             r.amount = parseFloat(i.value) || 0;
             if(r.isTotal) receiptTotal = r.amount || null;   // correcting a misread total
             refreshSum();
