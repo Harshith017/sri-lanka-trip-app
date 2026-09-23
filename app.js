@@ -177,6 +177,7 @@ var openDay = 1;
 var booted = false;
 var syncState = "ok";
 var unsubPeople = null, unsubBills = null, unsubSettlements = null, unsubItinerary = null, unsubTrip = null;
+var unsubRequests = null, unsubMyPerson = null, unsubMyRequest = null;
 var latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
 var itinerarySeeded = false;
 var joinShown = false;
@@ -553,9 +554,13 @@ function rebuildState(){
   if(!peopleSnap || !billsSnap || !settlementsSnap || !itinerarySnap || !tripSnap) return; // wait for all
 
   var settings = cloneSettings(DEFAULT_SETTINGS);
-  var inviteCode = "";
+  var admins = null;   // null = no admin list yet
   tripSnap.forEach(function(doc){
-    if(doc.id === "invite"){ var ic = doc.data().code; if(typeof ic === "string") inviteCode = ic; return; }
+    if(doc.id === "admins"){
+      var em = doc.data().emails;
+      admins = Array.isArray(em) ? em.filter(function(e){ return typeof e === "string"; }).map(normEmail) : [];
+      return;
+    }
     if(doc.id !== "settings") return;
     var d = doc.data();
     if(ymdToDate(d.startDate)) settings.startDate = d.startDate;
@@ -656,7 +661,7 @@ function rebuildState(){
   var byDay = {};
   itinerary.forEach(function(d){ byDay[d.day] = d; });
   S.settings = settings;
-  S.inviteCode = inviteCode;
+  S.admins = admins || [];
   var dated = [];
   for(var dn=1; dn<=tripLength(); dn++){
     var base = byDay[dn] || { day:dn, title:"Day "+dn, stay:"", items:[], tip:"", placeholder:true };
@@ -679,7 +684,10 @@ function rebuildState(){
   S.fetchedAt = new Date().toISOString();
 
   setSync("ok");
-  if(joined && !inviteCode) ensureInviteCode();
+  // The first member to open the app (the organiser) becomes the admin who
+  // approves join requests. Rules only allow creating this list once.
+  if(joined && admins === null) ensureAdmins();
+  if(joined && isAdmin()) startRequestsListener(); else stopRequestsListener();
   if(!booted){
     if(!joined){
       // Only draw the join form once — later snapshots (other people adding
@@ -711,34 +719,84 @@ function itemsFromFirestore(items){
   });
 }
 
-/* ---- Invite code ----
-   Joining needs the trip's invite code (Firestore rules compare it with
-   trip/invite, which only members can read). Anyone else who opens the link
-   and signs in with Google sees nothing but the join screen. */
-var inviteCreating = false;
-function makeInviteCode(){
-  var abc = "ABCDEFGHJKMNPQRSTUVWXYZ23456789", out = "", a = new Uint8Array(8);
-  crypto.getRandomValues(a);
-  for(var i=0;i<8;i++) out += abc[a[i] % abc.length];
-  return out;
+/* ---- Join requests ----
+   New people sign in with Google and send a join request (requests/{email}).
+   An admin approves it, which creates their people/{email} doc — only then
+   can they read or write anything. Rules enforce all of this. */
+var adminsCreating = false;
+function isAdmin(){ return (S.admins || []).indexOf(S.me) >= 0; }
+function ensureAdmins(){
+  if(adminsCreating) return;
+  adminsCreating = true;
+  db.collection("trip").doc("admins").set({ emails: [S.me] })
+    .catch(function(err){ console.warn("Couldn't create admin list:", err && err.code); });
 }
-function ensureInviteCode(){
-  if(inviteCreating) return;
-  inviteCreating = true;
-  db.collection("trip").doc("invite").set({ code: makeInviteCode(), updatedBy: S.me }, { merge:true })
-    .catch(function(err){ console.warn("Couldn't create invite code:", err && err.code); inviteCreating = false; });
+function appLink(){ return location.origin + location.pathname; }
+
+function startRequestsListener(){
+  if(unsubRequests) return;
+  unsubRequests = db.collection("requests").onSnapshot(function(snap){
+    var list = [];
+    snap.forEach(function(doc){
+      var d = doc.data({ serverTimestamps:"estimate" });
+      list.push({ email: doc.id, name: cleanText(d.name, MAX_NAME_LEN) || doc.id.split("@")[0],
+                  upi: cleanText(d.upi, MAX_UPI_LEN), photo: typeof d.photo === "string" ? d.photo : "",
+                  at: tsToIso(d.requestedAt) });
+    });
+    list.sort(function(a,b){ return String(a.at).localeCompare(String(b.at)); });
+    S.requests = list;
+    if(booted){ render(); updateRequestBadge(); }
+  }, function(err){ console.warn("requests listener:", err && err.code); S.requests = []; unsubRequests = null; });
 }
-function inviteLink(code){
-  return location.origin + location.pathname + "?code=" + encodeURIComponent(code || S.inviteCode || "");
+function stopRequestsListener(){
+  if(unsubRequests){ unsubRequests(); unsubRequests = null; }
+  S.requests = [];
 }
-function pendingInviteCode(){
-  var fromUrl = "";
-  try{ fromUrl = new URLSearchParams(location.search).get("code") || ""; }catch(e){}
-  if(fromUrl) lsSet("pw_invite", fromUrl);
-  return (fromUrl || lsGet("pw_invite") || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+function updateRequestBadge(){
+  var btn = document.querySelector('.tab-btn[data-tab="balances"]');
+  if(!btn) return;
+  var n = (S.requests || []).length, badge = btn.querySelector(".tab-badge");
+  if(n && !badge){ badge = document.createElement("span"); badge.className = "tab-badge"; btn.appendChild(badge); }
+  if(badge){ if(n) badge.textContent = n; else badge.remove(); }
+}
+
+function requestsCardHtml(){
+  var reqs = S.requests || [];
+  if(!isAdmin() || !reqs.length) return "";
+  return '<div class="card req-card"><div class="now-hero-lbl" style="margin-bottom:8px;">'+
+      reqs.length+' '+(reqs.length === 1 ? 'person wants' : 'people want')+' to join</div>'+
+    reqs.map(function(r){
+      return '<div class="req-row">'+
+        (r.photo ? '<div class="avatar"><img src="'+esc(r.photo)+'" alt=""></div>' : '<div class="avatar">'+esc(r.name.charAt(0).toUpperCase())+'</div>')+
+        '<div class="p-name">'+esc(r.name)+'<div class="p-sub">'+esc(r.email)+'</div></div>'+
+        '<button class="btn btn-line btn-sm" data-action="decline-req" data-id="'+esc(r.email)+'">Decline</button>'+
+        '<button class="btn btn-brand btn-sm" data-action="approve-req" data-id="'+esc(r.email)+'">Approve</button>'+
+      '</div>';
+    }).join("")+'</div>';
+}
+
+function approveRequest(email){
+  var r = (S.requests || []).filter(function(x){ return x.email === email; })[0];
+  if(!r) return Promise.reject(new Error("That request is gone."));
+  var batch = db.batch();
+  batch.set(db.collection("people").doc(docId(email)), {
+    name: r.name, upi: r.upi, photo: r.photo,
+    joinedAt: firebase.firestore.FieldValue.serverTimestamp(), approvedBy: S.me
+  });
+  batch.delete(db.collection("requests").doc(docId(email)));
+  return batch.commit();
+}
+function declineRequest(email){
+  return db.collection("requests").doc(docId(email)).delete();
+}
+
+function stopJoinWatch(){
+  if(unsubMyPerson){ unsubMyPerson(); unsubMyPerson = null; }
+  if(unsubMyRequest){ unsubMyRequest(); unsubMyRequest = null; }
 }
 
 function restartListeners(){
+  stopJoinWatch();
   [unsubPeople, unsubBills, unsubSettlements, unsubItinerary, unsubTrip].forEach(function(u){ if(u) u(); });
   unsubPeople = unsubBills = unsubSettlements = unsubItinerary = unsubTrip = null;
   latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
@@ -876,19 +934,13 @@ function requireMember(){
 
 /* ---- Write actions (replace google.script.run calls) ---- */
 
-function joinTrip(name, upi, code){
+function requestToJoin(name, upi){
   var cleanName = cleanText(name, MAX_NAME_LEN);
-  var cleanUpi = cleanText(upi, MAX_UPI_LEN);
-  var cleanCode = String(code || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
   if(!cleanName) return Promise.reject(new Error("Add your name so the group knows who you are."));
-  if(!cleanCode) return Promise.reject(new Error("Enter the invite code from the trip organiser."));
-  return db.collection("people").doc(docId(S.me)).set({
-    name: cleanName,
-    upi: cleanUpi,
-    photo: S.myPhoto || "",
-    joinCode: cleanCode,
-    joinedAt: firebase.firestore.FieldValue.serverTimestamp()
-  }, { merge:true });
+  return db.collection("requests").doc(docId(S.me)).set({
+    name: cleanName, upi: cleanText(upi, MAX_UPI_LEN), photo: S.myPhoto || "",
+    requestedAt: firebase.firestore.FieldValue.serverTimestamp()
+  });
 }
 
 /** Edits name/UPI only — leaves joinedAt alone so the member order is stable. */
@@ -1000,7 +1052,7 @@ function buildShell(){
   document.getElementById("app").innerHTML =
     '<header class="topbar">'+
       '<div class="topbar-row"><h1 class="trip-title"><img class="logo-sm" src="icon-192.png" alt="">Project W</h1>'+
-      '<button class="trip-dates" id="trip-dates" data-action="trip-settings" title="Change trip dates"></button></div>'+
+      '<button class="hdr-gear" data-action="trip-settings" aria-label="Trip settings" title="Trip settings">⚙️</button></div>'+
       '<div class="route-line">Colombo Airport → Kandy → Nuwara Eliya → Ella → Mirissa → Galle → Colombo</div>'+
       '<div class="whoami">'+
         '<span class="me"><span class="sync-dot" id="sync-dot"></span><span id="me-label"></span></span>'+
@@ -1049,14 +1101,14 @@ function render(){
   if(!booted) return;
   var me = person(S.me);
   document.getElementById("me-label").textContent = me.name + (me.upi ? " · " + me.upi : "");
-  var td = document.getElementById("trip-dates");
-  if(td) td.textContent = tripRangeLabel() + " ✎";
+
   var v = document.getElementById("view");
-  if(activeTab==="now") v.innerHTML = viewNow();
+  if(activeTab==="now") v.innerHTML = requestsCardHtml() + viewNow();
   else if(activeTab==="itinerary") v.innerHTML = viewItinerary();
-  else if(activeTab==="balances") v.innerHTML = viewBalances();
+  else if(activeTab==="balances") v.innerHTML = requestsCardHtml() + viewBalances();
   else if(activeTab==="bills") v.innerHTML = viewBills();
   else v.innerHTML = viewSettle();
+  updateRequestBadge();
 }
 
 /* ====================== Views ====================== */
@@ -1273,10 +1325,9 @@ function openTripSettingsSheet(){
   openSheetHtml(
     '<h3>Trip settings</h3>'+
     '<div class="field"><label>Invite friends</label>'+
-      '<div class="invite-box"><div class="invite-code" id="ts-code">'+esc(S.inviteCode || "creating…")+'</div>'+
-        '<button class="btn btn-brand btn-sm" id="ts-share">Share invite link</button></div>'+
-      '<div class="split-hint">Anyone with this code can join and see the trip. '+
-        '<a href="#" id="ts-newcode">Make a new code</a> if it gets passed around — people who already joined stay in.</div></div>'+
+      '<div class="invite-box"><div class="muted" style="font-size:13px;">They open the link, sign in with Google and ask to join. '+
+        (isAdmin() ? 'You approve them.' : 'The organiser approves them.')+'</div>'+
+        '<button class="btn btn-brand btn-sm" id="ts-share" style="flex:0 0 auto;">Share link</button></div></div>'+
     '<div style="display:flex;gap:10px;">'+
       '<div class="field" style="flex:1;"><label>Trip starts</label><input type="date" id="ts-start" value="'+esc(st.startDate)+'"></div>'+
       '<div class="field" style="flex:1;"><label>Trip ends</label><input type="date" id="ts-end" value="'+esc(st.endDate)+'"></div>'+
@@ -1292,24 +1343,12 @@ function openTripSettingsSheet(){
       var startIn = el.querySelector("#ts-start"), endIn = el.querySelector("#ts-end");
 
       el.querySelector("#ts-share").addEventListener("click", function(){
-        if(!S.inviteCode){ toast("Invite code is still being created — try again in a moment", true); return; }
-        var link = inviteLink(), text = "Join our Sri Lanka trip on Project W — invite code "+S.inviteCode;
+        var link = appLink(), text = "Join our Sri Lanka trip on Project W — open the link, sign in with Google and tap Ask to join.";
         if(navigator.share){
           navigator.share({ title:"Project W", text:text, url:link }).catch(function(){});
         } else if(navigator.clipboard){
-          navigator.clipboard.writeText(text+"\n"+link).then(function(){ toast("Invite link copied"); }, function(){ toast(link); });
+          navigator.clipboard.writeText(text+"\n"+link).then(function(){ toast("Link copied"); }, function(){ toast(link); });
         } else toast(link);
-      });
-      var newArmed = false;
-      el.querySelector("#ts-newcode").addEventListener("click", function(e){
-        e.preventDefault();
-        if(!newArmed){ newArmed = true; this.textContent = "Tap again to replace the code"; return; }
-        var code = makeInviteCode(), a = this;
-        db.collection("trip").doc("invite").set({ code: code, updatedBy: S.me }, { merge:true }).then(function(){
-          el.querySelector("#ts-code").textContent = code;
-          a.textContent = "Make a new code"; newArmed = false;
-          toast("New invite code: "+code+" — the old one no longer works");
-        }).catch(function(err){ toast(friendlyError(err), true); });
       });
 
       function lenHint(){
@@ -1497,23 +1536,66 @@ function closeSheet(){
   openSheetEl = null;
   setTimeout(function(){ if(el.parentNode) el.parentNode.removeChild(el); }, 220);
 }
-scrim.addEventListener("click", function(){
+scrim.addEventListener("click", dismissSheet);
+
+/** Closes the sheet the same way tapping outside does (runs its onDismiss). */
+function dismissSheet(){
   var cb = sheetOnDismiss;
   closeSheet();
   if(cb) cb();
-});
+}
 
 function openSheetHtml(html, onMount, onDismiss){
   closeSheet();
   var el = document.createElement("div");
   el.className = "sheet";
-  el.innerHTML = '<div class="sheet-handle"></div>' + html;
+  el.innerHTML = '<div class="sheet-handle"></div>'+
+    '<button class="sheet-x" aria-label="Close">✕</button>' + html;
   document.body.appendChild(el);
   openSheetEl = el;
   sheetOnDismiss = onDismiss || null;
   scrim.classList.add("show");
   requestAnimationFrame(function(){ el.classList.add("show"); });
+  el.querySelector(".sheet-x").addEventListener("click", dismissSheet);
+  enableSwipeDown(el);
   if(onMount) onMount(el);
+}
+
+/** Drag a sheet down to close it. Starts from the handle area anywhere, or
+    from inside the sheet when it's scrolled to the top — so scrolling a
+    long form up and down still works normally. */
+function enableSwipeDown(el){
+  var startY = null, dy = 0, dragging = false, fromTop = false, startT = 0;
+  el.addEventListener("touchstart", function(e){
+    if(e.touches.length !== 1) return;
+    var t = e.target, rect = el.getBoundingClientRect();
+    var onHandle = e.touches[0].clientY - rect.top < 44;
+    var tag = (t.tagName || "").toLowerCase();
+    if(!onHandle && (tag === "input" || tag === "textarea" || tag === "select")) return;
+    fromTop = onHandle || el.scrollTop <= 0;
+    if(!fromTop) return;
+    startY = e.touches[0].clientY; dy = 0; dragging = false; startT = Date.now();
+  }, { passive:true });
+  el.addEventListener("touchmove", function(e){
+    if(startY == null) return;
+    dy = e.touches[0].clientY - startY;
+    if(!dragging){
+      if(dy > 8 && el.scrollTop <= 0){ dragging = true; el.style.transition = "none"; }
+      else if(dy < -4){ startY = null; return; }   // scrolling up: normal scroll
+      else return;
+    }
+    e.preventDefault();
+    el.style.transform = "translateY(" + Math.max(0, dy) + "px)";
+  }, { passive:false });
+  el.addEventListener("touchend", function(){
+    if(startY == null) return;
+    var fast = dy > 60 && (Date.now() - startT) < 250;
+    startY = null;
+    if(!dragging) return;
+    el.style.transition = "";
+    if(dy > 110 || fast){ el.style.transform = ""; dismissSheet(); }
+    else el.style.transform = "";
+  });
 }
 
 /* ---- Join / profile ---- */
@@ -1522,36 +1604,68 @@ function showJoinScreen(){
   var sp = document.getElementById("boot-spinner");
   if(sp) sp.style.display = "none";
   var bm = document.getElementById("boot-msg");
-  if(bm) bm.textContent = "You're signed in. Enter the invite code and your name to join the trip.";
-  var be = document.getElementById("boot-extra");
-  if(be) be.innerHTML =
-    '<div class="join-card">'+
-      '<div class="join-email">'+(S.myPhoto?'<img src="'+esc(S.myPhoto)+'" alt="">':'')+'<span>'+esc(S.me)+'</span></div>'+
-      '<div class="field"><label>Invite code</label>'+
-        '<input type="text" id="j-code" placeholder="From the trip organiser" maxlength="12" autocapitalize="characters" autocomplete="off" value="'+esc(pendingInviteCode())+'"></div>'+
-      '<div class="field"><label>Your name</label>'+
-        '<input type="text" id="j-name" placeholder="How the group knows you" maxlength="40"></div>'+
-      '<div class="field"><label>UPI ID <span class="muted">(optional — so others can pay you)</span></label>'+
-        '<input type="text" id="j-upi" placeholder="name@bank" maxlength="60"></div>'+
-      '<button class="btn btn-brand btn-wide" id="j-go">Join the trip</button>'+
-    '</div>';
-  document.getElementById("j-go").addEventListener("click", function(){
-    var name = document.getElementById("j-name").value.trim();
-    var code = document.getElementById("j-code").value.trim();
-    if(!code){ toast("Enter the invite code first", true); return; }
-    if(!name){ toast("Add your name first", true); return; }
-    var btn = this;
-    btn.disabled = true; btn.textContent = "Joining…";
-    joinTrip(name, document.getElementById("j-upi").value.trim(), code).then(function(){
-      lsSet("pw_invite", null);
-      toast("Welcome aboard");
-      restartListeners();   // now a member: the trip data can be read
-    }).catch(function(err){
-      btn.disabled = false; btn.textContent = "Join the trip";
-      toast(err && err.code === "permission-denied" ? "That invite code isn't right — check it with the organiser." : friendlyError(err), true);
+  if(bm) bm.textContent = "Checking…";
+  // Watch our own people doc (appears when approved) and our request (to
+  // show "waiting" vs the form, and notice a decline).
+  stopJoinWatch();
+  var hadRequest = false;
+  unsubMyPerson = db.collection("people").doc(docId(S.me)).onSnapshot(function(doc){
+    if(doc.exists){ toast("You're in — welcome aboard!"); restartListeners(); }
+  }, function(){});
+  unsubMyRequest = db.collection("requests").doc(docId(S.me)).onSnapshot(function(doc){
+    if(doc.exists){ hadRequest = true; renderWaiting(doc.data()); }
+    else if(hadRequest){
+      // Request removed without an approval arriving → declined (give the
+      // approval a moment to land first, since both happen together).
+      setTimeout(function(){ if(unsubMyRequest) renderForm("Your request wasn't approved. Check with the organiser, then ask again."); }, 2500);
+    } else renderForm("");
+  }, function(){ renderForm(""); });
+
+  function renderForm(note){
+    hadRequest = false;
+    if(bm) bm.textContent = note || "You're signed in. Ask to join — the organiser will approve you.";
+    var be = document.getElementById("boot-extra");
+    if(!be) return;
+    be.innerHTML =
+      '<div class="join-card">'+
+        '<div class="join-email">'+(S.myPhoto?'<img src="'+esc(S.myPhoto)+'" alt="">':'')+'<span>'+esc(S.me)+'</span></div>'+
+        '<div class="field"><label>Your name</label>'+
+          '<input type="text" id="j-name" placeholder="How the group knows you" maxlength="40"></div>'+
+        '<div class="field"><label>UPI ID <span class="muted">(optional — so others can pay you)</span></label>'+
+          '<input type="text" id="j-upi" placeholder="name@bank" maxlength="60"></div>'+
+        '<button class="btn btn-brand btn-wide" id="j-go">Ask to join</button>'+
+        '<button class="btn btn-ghost btn-wide" id="j-out" style="margin-top:8px;">Use a different Google account</button>'+
+      '</div>';
+    document.getElementById("j-go").addEventListener("click", function(){
+      var name = document.getElementById("j-name").value.trim();
+      if(!name){ toast("Add your name first", true); return; }
+      var btn = this;
+      btn.disabled = true; btn.textContent = "Sending…";
+      requestToJoin(name, document.getElementById("j-upi").value.trim()).catch(function(err){
+        btn.disabled = false; btn.textContent = "Ask to join";
+        toast(friendlyError(err), true);
+      });
     });
-  });
-  document.getElementById(pendingInviteCode() ? "j-name" : "j-code").focus();
+    document.getElementById("j-out").addEventListener("click", function(){ auth.signOut(); });
+  }
+
+  function renderWaiting(d){
+    if(bm) bm.textContent = "Request sent ✓";
+    var be = document.getElementById("boot-extra");
+    if(!be) return;
+    be.innerHTML =
+      '<div class="join-card" style="text-align:center;">'+
+        '<div style="font-size:30px;">⏳</div>'+
+        '<div style="font-weight:700;margin:6px 0 4px;">Waiting for the organiser to approve you</div>'+
+        '<div class="muted" style="font-size:13px;line-height:1.5;">You asked to join as <b>'+esc(d && d.name || "")+'</b>. '+
+          'Keep this open or come back later — you\'ll get in automatically once you\'re approved.</div>'+
+        '<button class="btn btn-ghost btn-wide" id="j-cancel" style="margin-top:14px;">Cancel request</button>'+
+      '</div>';
+    document.getElementById("j-cancel").addEventListener("click", function(){
+      hadRequest = false;
+      db.collection("requests").doc(docId(S.me)).delete().catch(function(err){ toast(friendlyError(err), true); });
+    });
+  }
 }
 
 function openProfileSheet(){
@@ -2348,6 +2462,14 @@ document.addEventListener("click", function(e){
     openDay = (openDay===d) ? 0 : d;
     render();
   }
+  else if(a==="approve-req"){
+    var who = t.dataset.id, nm = ((S.requests||[]).filter(function(x){ return x.email === who; })[0] || {}).name || who;
+    writeOp(approveRequest(who), nm+" is in", t);
+  }
+  else if(a==="decline-req"){
+    if(t.dataset.armed !== "1"){ t.dataset.armed = "1"; t.textContent = "Sure?"; setTimeout(function(){ t.dataset.armed = ""; t.textContent = "Decline"; }, 3000); return; }
+    writeOp(declineRequest(t.dataset.id), "Request declined", t);
+  }
   else if(a==="trip-settings"){
     openTripSettingsSheet();
   }
@@ -2601,6 +2723,9 @@ function teardown(){
   if(unsubTrip) unsubTrip();
   unsubPeople = unsubBills = unsubSettlements = unsubItinerary = unsubTrip = null;
   latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
+  stopRequestsListener();
+  stopJoinWatch();
+  adminsCreating = false;
   itinerarySeeded = false;
   if(nowTimer){ clearInterval(nowTimer); nowTimer = null; }
   closeSheet();
