@@ -116,13 +116,37 @@ test("measured maintenance waits for enough data", function () {
   assert.ok(r.need.length >= 2);
 });
 
-test("every built-in food's calories match its macros (general Atwater, ±12%; USDA uses food-specific factors)", function () {
-  // Low-calorie vegetables are skipped: their fibre counts as carbohydrate
-  // but yields ~2 kcal/g, so 4/4/9 overstates them.
-  FOODS.filter(function (f) { return f.kcal >= 60; }).forEach(function (f) {
-    var k = C.kcalFromMacros(f.p, f.c, f.f, f.a);
-    assert.ok(Math.abs(k - f.kcal) <= Math.max(6, f.kcal * 0.12), f.name + ": " + f.kcal + " vs " + k.toFixed(0));
+test("every built-in food's calories match its macros (within 12%)", function () {
+  FOODS.FOOD_ROWS.forEach(function (r) {
+    var name = r[0], kcal = r[3], p = r[4], c = r[5], f = r[6], fibre = r[7];
+    var off = C.atwaterMismatch(kcal, p, c, f, fibre, FOODS.FOOD_ALCOHOL[name]);
+    assert.ok(kcal < 40 || off <= 0.12, name + ": " + kcal + " kcal is " + Math.round(off * 100) + "% off its macros");
   });
+});
+
+test("every food row has all 14 micronutrient columns", function () {
+  FOODS.FOOD_ROWS.forEach(function (r) {
+    assert.strictEqual(r.length, 9 + FOODS.FOOD_MICRO_ORDER.length, r[0]);
+  });
+});
+
+test("age- and sex-specific nutrient targets", function () {
+  assert.strictEqual(C.microTargets("female", 25).iron_mg, 18);
+  assert.strictEqual(C.microTargets("female", 55).iron_mg, 8);
+  assert.strictEqual(C.microTargets("female", 55).calcium_mg, 1200);
+  assert.strictEqual(C.microTargets("male", 35).magnesium_mg, 420);
+  assert.strictEqual(C.microTargets("male", 17).calcium_mg, 1300);
+});
+
+test("net energy from a MET value removes resting burn", function () {
+  var r = C.netKcalFromMet(7, 70, 60, 1680);
+  near(r.gross, 514.5, 0.01);
+  near(r.net, 514.5 - 70, 0.01);
+});
+
+test("Atwater check tolerates fibre either way and counts alcohol", function () {
+  assert.ok(C.atwaterMismatch(43, 0.5, 3.6, 0, 0, 3.9) < 0.02);   // beer
+  assert.ok(C.atwaterMismatch(400, 10, 10, 10, 0, 0) > 0.5);       // clearly wrong
 });
 
 test("step distance", function () {

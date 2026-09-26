@@ -1,30 +1,26 @@
-/* Pulse service worker — app works offline after the first visit.
-   Bump VERSION when shipping changes so phones pick them up. */
-var VERSION = "pulse-v1";
-var SHELL = ["./", "index.html", "app.js", "calc.js", "foods.js", "manifest.json", "icon-192.png", "icon-180.png", "icon-512.png"];
+/* Fuel & Lift service worker: the app opens offline after the first visit.
+   Bump VERSION when shipping changes. */
+const VERSION = 'fuel-lift-v1';
+const SHELL = ['./', 'index.html', 'config.js', 'calc.js', 'foods.js', 'backend.js', 'app.js', 'manifest.json', 'icon-192.png', 'icon-180.png', 'icon-512.png',
+  'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js'];
 
-self.addEventListener("install", function (e) {
-  e.waitUntil(caches.open(VERSION).then(function (c) { return c.addAll(SHELL); }).then(function () { return self.skipWaiting(); }));
+self.addEventListener('install', e => {
+  e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
 });
-self.addEventListener("activate", function (e) {
-  e.waitUntil(caches.keys().then(function (keys) {
-    return Promise.all(keys.filter(function (k) { return k !== VERSION; }).map(function (k) { return caches.delete(k); }));
-  }).then(function () { return self.clients.claim(); }));
+self.addEventListener('activate', e => {
+  e.waitUntil(caches.keys().then(keys => Promise.all(keys.filter(k => k !== VERSION).map(k => caches.delete(k)))).then(() => self.clients.claim()));
 });
-self.addEventListener("fetch", function (e) {
-  var req = e.request, url = new URL(req.url);
-  if (req.method !== "GET" || url.hostname.indexOf("openfoodfacts.org") >= 0) return; // food search is live-only
-  var sameOrigin = url.origin === self.location.origin;
-  var isFont = /fonts\.(googleapis|gstatic)\.com$/.test(url.hostname);
-  if (!sameOrigin && !isFont) return;
+self.addEventListener('fetch', e => {
+  const req = e.request, url = new URL(req.url);
+  if (req.method !== 'GET') return;
+  // Never cache the database, sign-in or Claude.
+  if (/supabase\.co$/.test(url.hostname) || url.pathname.includes('/functions/')) return;
+  const own = url.origin === self.location.origin;
+  const cdn = /^(cdn\.jsdelivr\.net|cdnjs\.cloudflare\.com|fonts\.googleapis\.com|fonts\.gstatic\.com)$/.test(url.hostname);
+  if (!own && !cdn) return;
   // Stale-while-revalidate: instant from cache, refreshed in the background.
-  e.respondWith(caches.open(VERSION).then(function (cache) {
-    return cache.match(req, { ignoreSearch: sameOrigin }).then(function (hit) {
-      var net = fetch(req).then(function (res) {
-        if (res && (res.ok || res.type === "opaque")) cache.put(req, res.clone());
-        return res;
-      }).catch(function () { return hit; });
-      return hit || net;
-    });
-  }));
+  e.respondWith(caches.open(VERSION).then(cache => cache.match(req, { ignoreSearch: own }).then(hit => {
+    const net = fetch(req).then(res => { if (res && (res.ok || res.type === 'opaque')) cache.put(req, res.clone()); return res; }).catch(() => hit);
+    return hit || net;
+  })));
 });

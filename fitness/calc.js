@@ -1,4 +1,4 @@
-/* Pulse — calculation engine.
+/* Fuel & Lift — calculation engine.
    Every number the app shows comes from here, so it is kept free of DOM code
    and covered by calc.test.js (run: node --test fitness/).
 
@@ -19,10 +19,10 @@
   var KCAL_PER_L_O2 = 5.0;
 
   var ACTIVITY_LEVELS = [
-    { id: "sedentary", factor: 1.2,   label: "Mostly sitting",   desc: "Desk job, little walking (under ~5,000 steps)" },
-    { id: "light",     factor: 1.375, label: "Lightly active",   desc: "Some walking, on your feet part of the day (5,000–7,500 steps)" },
-    { id: "moderate",  factor: 1.55,  label: "Active",           desc: "On your feet most of the day (7,500–10,000 steps)" },
-    { id: "very",      factor: 1.725, label: "Very active",      desc: "Physical job or lots of walking (10,000+ steps)" }
+    { id: "sedentary", factor: 1.2,   label: "Mostly sitting: desk job, under ~5,000 steps" },
+    { id: "light",     factor: 1.375, label: "Lightly active: some walking, 5,000–7,500 steps" },
+    { id: "moderate",  factor: 1.55,  label: "Active: on your feet most of the day, 7,500–10,000 steps" },
+    { id: "very",      factor: 1.725, label: "Very active: physical job, 10,000+ steps" }
   ];
 
   /* kind: how calories are worked out when you give more detail.
@@ -211,6 +211,43 @@
     return reps === 1 ? kg : kg * (1 + reps / 30);
   }
 
+  /* Net energy of an activity described by a MET value: gross cost minus
+     the resting burn you'd have had anyway in those minutes. */
+  function netKcalFromMet(met, kg, minutes, bmrKcal) {
+    var gross = grossKcalFromMet(met, kg, minutes);
+    return { gross: gross, net: Math.max(0, gross - bmrKcal / 1440 * minutes) };
+  }
+
+  /* Daily reference intakes (US National Academies DRIs; sodium per WHO),
+     by sex and age band. */
+  function microTargets(sex, age) {
+    var f = sex === "female", teen = age < 19, a = age || 30;
+    return {
+      cholesterol_mg: 300, sodium_mg: 2000,
+      potassium_mg: teen ? (f ? 2300 : 3000) : (f ? 2600 : 3400),
+      calcium_mg: teen ? 1300 : (f ? (a > 50 ? 1200 : 1000) : (a > 70 ? 1200 : 1000)),
+      iron_mg: teen ? (f ? 15 : 11) : (f ? (a > 50 ? 8 : 18) : 8),
+      magnesium_mg: teen ? (f ? 360 : 410) : (f ? (a > 30 ? 320 : 310) : (a > 30 ? 420 : 400)),
+      zinc_mg: teen && f ? 9 : (f ? 8 : 11),
+      vitamin_a_mcg: f ? 700 : 900,
+      vitamin_c_mg: teen ? (f ? 65 : 75) : (f ? 75 : 90),
+      vitamin_d_mcg: a > 70 ? 20 : 15,
+      vitamin_b12_mcg: 2.4,
+      folate_mcg: 400,
+      omega3_g: f ? 1.1 : 1.6
+    };
+  }
+
+  /* Do a food's calories agree with its macros? Carbs may or may not include
+     fibre (Indian tables usually exclude it, USDA includes it), so both
+     readings are tried. Returns the relative mismatch (0 = perfect). */
+  function atwaterMismatch(kcal, p, c, f, fibre, alcohol) {
+    if (!(kcal > 0)) return 0;
+    var base = p * 4 + f * 9 + (alcohol || 0) * 7;
+    var a = base + c * 4, b = base + Math.max(0, c - (fibre || 0)) * 4 + (fibre || 0) * 2;
+    return Math.min(Math.abs(a - kcal), Math.abs(b - kcal)) / kcal;
+  }
+
   function stepLengthM(cm, sex) { return cm * (sex === "female" ? 0.413 : 0.415) / 100; }
   function stepsToKm(steps, cm, sex) { return steps * stepLengthM(cm, sex) / 1000; }
   // Tudor-Locke & Bassett step bands → our activity levels.
@@ -310,7 +347,8 @@
     keytelKcalPerMin: keytelKcalPerMin, workoutEnergy: workoutEnergy,
     calorieTarget: calorieTarget, macroTargets: macroTargets, defaultProteinPerKg: defaultProteinPerKg,
     waterTargetMl: waterTargetMl, bmi: bmi, bmiCategory: bmiCategory, navyBodyFat: navyBodyFat,
-    e1rm: e1rm, stepLengthM: stepLengthM, stepsToKm: stepsToKm, levelFromSteps: levelFromSteps,
+    e1rm: e1rm, netKcalFromMet: netKcalFromMet, microTargets: microTargets, atwaterMismatch: atwaterMismatch,
+    stepLengthM: stepLengthM, stepsToKm: stepsToKm, levelFromSteps: levelFromSteps,
     weightTrend: weightTrend, linreg: linreg, adaptiveMaintenance: adaptiveMaintenance,
     scaleFood: scaleFood, kcalFromMacros: kcalFromMacros
   };
