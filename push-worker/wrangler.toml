@@ -1,0 +1,7 @@
+name = "project-w-push"
+main = "worker.js"
+compatibility_date = "2026-09-01"
+
+[[kv_namespaces]]
+binding = "PUSH_KV"
+id = "PUT_YOUR_KV_NAMESPACE_ID_HERE"

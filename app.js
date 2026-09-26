@@ -743,7 +743,13 @@ function rebuildState(){
       return;
     }
     booted = true;
+    var hashTab = location.hash.replace("#","");
+    if(TAB_IDS.indexOf(hashTab) >= 0){
+      activeTab = hashTab;
+      history.replaceState(null, "", location.pathname + location.search);
+    }
     buildShell();
+    checkPushOnBoot();
     if(!passkeyOffered){
       passkeyOffered = true;
       setTimeout(function(){ if(booted && !openSheetEl) offerPasskeySetup(S.me); }, 900);
@@ -987,7 +993,7 @@ function requestToJoin(name, upi){
   return db.collection("requests").doc(docId(S.me)).set({
     name: cleanName, upi: cleanText(upi, MAX_UPI_LEN), photo: S.myPhoto || "",
     requestedAt: firebase.firestore.FieldValue.serverTimestamp()
-  });
+  }).then(function(){ sendPush({ joinRequest: true }); });
 }
 
 /** Edits name/UPI only — leaves joinedAt alone so the member order is stable. */
@@ -1017,7 +1023,7 @@ function addBill(payload){
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       deleted: false
-    });
+    }).then(function(){ notifyBill(bill, id, null); });
   } catch(e){ return Promise.reject(e); }
 }
 
@@ -1026,6 +1032,7 @@ function updateBill(id, payload){
     requireMember();
     var peopleEmails = S.people.map(function(p){ return p.email; });
     var bill = validateBill(payload, peopleEmails);
+    var before = S.bills.filter(function(b){ return b.id === id; })[0] || null;
     return db.collection("bills").doc(id).update({
       desc: bill.desc, amount: bill.amount, category: bill.category,
       paidBy: bill.paidBy, split: bill.split,
@@ -1036,7 +1043,7 @@ function updateBill(id, payload){
       extras: bill.extras && bill.extras.length ? bill.extras : null,
       currency: bill.currency, origAmount: bill.origAmount, fx: bill.fx, billDate: bill.billDate,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    });
+    }).then(function(){ notifyBill(bill, id, before || { split: [], paidBy: "" }); });
   } catch(e){ return Promise.reject(e); }
 }
 
@@ -1064,7 +1071,7 @@ function addSettlement(fromEmail, toEmail, amount){
       from: from, to: to, amount: amt, markedBy: S.me,
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       deleted: false
-    });
+    }).then(function(){ notifySettlement(from, to, amt); });
   } catch(e){ return Promise.reject(e); }
 }
 
@@ -1093,6 +1100,191 @@ function updateItinerary(day, payload){
       updatedBy: S.me, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
     }, { merge:true });
   } catch(e){ return Promise.reject(e); }
+}
+
+/* ====================== Notifications ======================
+   Web Push through a small Cloudflare Worker (push-worker/): this device
+   registers there, and after a write the app asks the worker to ping the
+   other people it involves. Works with the app closed; on iPhone only once
+   Project W is added to the Home Screen. */
+
+var PUSH_URL = (typeof PUSH_WORKER_URL === "string" ? PUSH_WORKER_URL : "").trim().replace(/\/+$/, "");
+var TAB_IDS = ["now","itinerary","balances","bills","settle"];
+
+function isIos(){ return /iPad|iPhone|iPod/.test(navigator.userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1); }
+function isStandalone(){ return navigator.standalone === true || (window.matchMedia && window.matchMedia("(display-mode: standalone)").matches); }
+function pushSupported(){ return !!(PUSH_URL && "serviceWorker" in navigator && "PushManager" in window && "Notification" in window); }
+/** iPhone Safari only allows push from the Home Screen app. */
+function pushNeedsInstall(){ return !!PUSH_URL && isIos() && !isStandalone(); }
+function pushOnHere(){ return pushSupported() && Notification.permission === "granted" && lsGet("pw_push_on") === S.me; }
+
+if(PUSH_URL && "serviceWorker" in navigator){
+  navigator.serviceWorker.register("sw.js").catch(function(err){ console.warn("Service worker:", err && err.message); });
+  navigator.serviceWorker.addEventListener("message", function(e){
+    if(e.data && e.data.type === "open-tab" && booted && TAB_IDS.indexOf(e.data.tab) >= 0) setTab(e.data.tab);
+  });
+}
+
+function pushCall(path, data){
+  var user = auth.currentUser;
+  if(!user) return Promise.reject(new Error("Sign in first."));
+  return user.getIdToken().then(function(token){
+    return fetch(PUSH_URL + path, {
+      method: "POST",
+      headers: { "Authorization": "Bearer " + token, "Content-Type": "application/json" },
+      body: JSON.stringify(data || {})
+    });
+  }).then(function(res){
+    return res.json().catch(function(){ return {}; }).then(function(out){
+      if(!res.ok) throw new Error(out.error || ("Notification server error " + res.status));
+      return out;
+    });
+  });
+}
+
+function b64uToBytes(s){
+  var bin = atob(s.replace(/-/g,"+").replace(/_/g,"/") + "===".slice((s.length + 3) % 4));
+  var out = new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+function sameBytes(buf, bytes){
+  if(!buf) return false;
+  var a = new Uint8Array(buf);
+  if(a.length !== bytes.length) return false;
+  for(var i=0;i<a.length;i++) if(a[i] !== bytes[i]) return false;
+  return true;
+}
+
+/** Makes sure this device has a push subscription for the worker's current
+    key and that the worker has it on file for this person. */
+function syncPushSubscription(){
+  return Promise.all([
+    navigator.serviceWorker.ready,
+    fetch(PUSH_URL + "/vapid").then(function(r){ return r.json(); })
+  ]).then(function(res){
+    var reg = res[0], key = b64uToBytes(res[1].key);
+    return reg.pushManager.getSubscription().then(function(sub){
+      if(sub && sameBytes(sub.options && sub.options.applicationServerKey, key)) return sub;
+      return (sub ? sub.unsubscribe() : Promise.resolve()).then(function(){
+        return reg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey:key });
+      });
+    });
+  }).then(function(sub){
+    return pushCall("/subscribe", { sub: sub.toJSON() });
+  }).then(function(){
+    lsSet("pw_push_on", S.me);
+    lsSet("pw_push_synced", String(Date.now()));
+  });
+}
+
+function enablePush(){
+  if(!pushSupported()) return Promise.reject(new Error(pushNeedsInstall()
+    ? "Add Project W to your Home Screen first (Share → Add to Home Screen), then turn this on there."
+    : "This browser can't get notifications."));
+  return Promise.resolve(Notification.requestPermission()).then(function(p){
+    if(p !== "granted") throw new Error(p === "denied"
+      ? "Notifications are blocked — allow them for Project W in your phone's settings."
+      : "Notifications weren't allowed.");
+    return syncPushSubscription();
+  });
+}
+
+function disablePush(){
+  lsSet("pw_push_on", null);
+  if(!pushSupported()) return Promise.resolve();
+  return navigator.serviceWorker.getRegistration().then(function(reg){
+    return reg ? reg.pushManager.getSubscription() : null;
+  }).then(function(sub){
+    if(!sub) return;
+    return pushCall("/unsubscribe", { endpoint: sub.endpoint })
+      .catch(function(err){ console.warn("unsubscribe:", err && err.message); })
+      .then(function(){ return sub.unsubscribe(); });
+  });
+}
+
+/** On each launch: re-register once a day (subscriptions can rotate, and
+    this keeps the organiser flag current), or offer to turn push on. */
+function checkPushOnBoot(){
+  if(!pushSupported()) return;
+  if(lsGet("pw_push_on") === S.me){
+    if(Notification.permission !== "granted"){ lsSet("pw_push_on", null); return; }
+    var last = Number(lsGet("pw_push_synced")) || 0;
+    if(Date.now() - last > 24*3600*1000){
+      syncPushSubscription().catch(function(err){ console.warn("push sync:", err && err.message); });
+    }
+    return;
+  }
+  if(Notification.permission === "denied" || lsGet("pw_push_asked") === S.me) return;
+  setTimeout(function(){ if(booted && !openSheetEl) offerPushSetup(); }, 2500);
+}
+
+function offerPushSetup(){
+  openSheetHtml(
+    '<h3>Get notified?</h3>'+
+    '<p class="muted" style="font-size:13.5px;line-height:1.5;">Get a notification when someone adds or edits a bill you\'re in, or marks a payment to or from you'+
+      (isAdmin() ? ', and when someone asks to join' : '')+'. You can turn this off any time from Edit.</p>'+
+    '<div class="sheet-actions">'+
+      '<button class="btn btn-ghost" id="pn-skip">Not now</button>'+
+      '<button class="btn btn-brand" id="pn-go">Turn on</button>'+
+    '</div>',
+    function(el){
+      el.querySelector("#pn-skip").addEventListener("click", function(){
+        lsSet("pw_push_asked", S.me);
+        closeSheet();
+      });
+      el.querySelector("#pn-go").addEventListener("click", function(){
+        var btn = this; btn.disabled = true;
+        lsSet("pw_push_asked", S.me);
+        enablePush().then(function(){
+          closeSheet();
+          toast("Notifications are on for this device");
+        }).catch(function(err){
+          btn.disabled = false;
+          toast(err && err.message ? err.message : "Couldn't turn notifications on", true);
+        });
+      });
+    },
+    function(){ lsSet("pw_push_asked", S.me); }
+  );
+}
+
+/** Fire-and-forget: a failed notification must never look like a failed save. */
+function sendPush(data){
+  if(!PUSH_URL) return;
+  pushCall("/notify", data).catch(function(err){ console.warn("notify:", err && err.message); });
+}
+
+function billTotalText(bill){
+  return (bill.currency === "LKR" && bill.origAmount) ? money(bill.origAmount, "LKR") : inr(bill.amount);
+}
+
+/** Everyone the bill involves (and, on an edit, anyone it used to), each
+    told their own share. */
+function notifyBill(bill, id, before){
+  var shares = {};
+  try{ shares = billShares(bill); }catch(e){}
+  var me = pName(S.me), payer = pName(bill.paidBy), total = billTotalText(bill);
+  var to = {};
+  bill.split.concat([bill.paidBy]).forEach(function(e){ to[e] = true; });
+  if(before) (before.split || []).concat([before.paidBy]).forEach(function(e){ if(e) to[e] = true; });
+  var messages = Object.keys(to).filter(function(e){ return e !== S.me; }).map(function(e){
+    var inBill = bill.split.indexOf(e) >= 0 || bill.paidBy === e;
+    var text;
+    if(!inBill) text = me + " took you off this bill";
+    else if(bill.paidBy === e) text = "You paid " + total + (shares[e] ? " · your share " + inr(shares[e]) : "") + (before ? " · edited by " : " · added by ") + me;
+    else text = payer + " paid " + total + " · your share " + inr(shares[e] || 0);
+    return { to: e, title: (before ? "Bill edited: " : "New bill: ") + bill.desc, body: text };
+  });
+  if(messages.length) sendPush({ messages: messages, tag: "bill-" + id, tab: "bills" });
+}
+
+function notifySettlement(from, to, amt){
+  var me = pName(S.me), by = (S.me !== from) ? " · marked by " + me : "";
+  var messages = [];
+  if(to !== S.me) messages.push({ to: to, title: "Payment recorded", body: pName(from) + " paid you " + inr(amt) + by });
+  if(from !== S.me) messages.push({ to: from, title: "Payment recorded", body: "You paid " + pName(to) + " " + inr(amt) + " · marked by " + me });
+  if(messages.length) sendPush({ messages: messages, tab: "settle" });
 }
 
 /* ====================== Shell ====================== */
@@ -1728,6 +1920,13 @@ function openProfileSheet(){
       ? '<div class="field"><label>Face ID lock on this device</label>'+
           '<button class="btn btn-line btn-sm" id="p-faceid">'+(passkeyFor(S.me) ? "Turn off Face ID lock" : "Turn on Face ID lock")+'</button></div>'
       : '')+
+    (pushSupported()
+      ? '<div class="field"><label>Notifications on this device</label>'+
+          '<button class="btn btn-line btn-sm" id="p-push">'+(pushOnHere() ? "Turn off notifications" : "Turn on notifications")+'</button></div>'
+      : pushNeedsInstall()
+      ? '<div class="field"><label>Notifications</label><div class="muted" style="font-size:13px;line-height:1.5;">'+
+          'To get notifications on iPhone, add Project W to your Home Screen (Share → Add to Home Screen), open it from there and turn them on here.</div></div>'
+      : '')+
     '<div class="sheet-actions"><button class="btn btn-brand" id="p-save">Save</button>'+
     '<button class="btn btn-ghost" id="p-signout">Sign out</button></div>',
     function(el){
@@ -1757,9 +1956,24 @@ function openProfileSheet(){
           });
         }
       });
+      var pb = el.querySelector("#p-push");
+      if(pb) pb.addEventListener("click", function(){
+        pb.disabled = true;
+        var turningOn = !pushOnHere();
+        (turningOn ? enablePush() : disablePush()).then(function(){
+          pb.disabled = false;
+          pb.textContent = turningOn ? "Turn off notifications" : "Turn on notifications";
+          toast(turningOn ? "Notifications are on for this device" : "Notifications turned off");
+        }).catch(function(err){
+          pb.disabled = false;
+          toast(err && err.message ? err.message : "Couldn't change notifications", true);
+        });
+      });
       el.querySelector("#p-signout").addEventListener("click", function(){
         closeSheet();
-        auth.signOut();
+        // Stop this device getting the old account's notifications.
+        var out = function(){ auth.signOut(); };
+        (pushOnHere() ? disablePush() : Promise.resolve()).then(out, out);
       });
     }
   );

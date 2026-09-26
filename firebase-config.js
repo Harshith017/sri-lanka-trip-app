@@ -12,3 +12,8 @@ var firebaseConfig = {
 };
 
 firebase.initializeApp(firebaseConfig);
+
+// Address of the push-notification worker (see push-worker/README.md), e.g.
+// "https://project-w-push.yourname.workers.dev". Leave empty to hide
+// notifications in the app.
+var PUSH_WORKER_URL = "";
