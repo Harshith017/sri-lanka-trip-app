@@ -67,6 +67,7 @@
     function queue(op, c, id, data) {
       pending = pending.filter(p => !(p.c === c && p.id === id));   // last write wins
       pending.push({ op, c, id, data: op === 'set' ? clone(data) : null });
+      idb.set(PKEY, pending);   // right away: this is the only copy until it syncs
       persist(); flush();
     }
     async function flush() {
@@ -85,7 +86,7 @@
             if (/docs_size|check constraint|violates/i.test(error.message || '')) { pending.shift(); hooks.onError && hooks.onError('too_large', p); continue; }
             throw error;
           }
-          pending.shift(); persist();
+          pending.shift(); idb.set(PKEY, pending); persist();
         }
         status('synced');
       } catch (e) {
@@ -97,7 +98,7 @@
     async function pull() {
       const fresh = new Map();
       for (let from = 0; ; from += 1000) {
-        const { data, error } = await sb.from('docs').select('collection,id,data').eq('user_id', uid).range(from, from + 999);
+        const { data, error } = await sb.from('docs').select('collection,id,data').eq('user_id', uid).order('collection').order('id').range(from, from + 999);
         if (error) throw error;
         for (const r of data) { if (!fresh.has(r.collection)) fresh.set(r.collection, new Map()); fresh.get(r.collection).set(r.id, r.data); }
         if (data.length < 1000) break;
@@ -118,12 +119,13 @@
         sb.channel('docs-' + uid)
           .on('postgres_changes', { event: '*', schema: 'public', table: 'docs', filter: 'user_id=eq.' + uid }, pl => {
             const row = pl.new && pl.new.collection ? pl.new : pl.old;
-            if (!row || !row.collection) return;
+            if (!row || !row.collection || row.user_id !== uid) return;
             if (pending.some(p => p.c === row.collection && p.id === row.id)) return; // our own write is newer
             if (pl.eventType === 'DELETE') col(row.collection).delete(row.id); else col(row.collection).set(row.id, row.data);
             persist(); notify(row.collection);
           }).subscribe();
-        addEventListener('online', flush);
+        // First launch offline: load everything from the server once we're back online.
+        addEventListener('online', () => { if (!synced) pull().catch(() => {}); flush(); });
         let hiddenAt = 0;
         document.addEventListener('visibilitychange', () => {
           if (document.hidden) { hiddenAt = Date.now(); return; }
@@ -149,6 +151,8 @@
         };
         return chain;
       },
+      /* Forget this person's data on this device (sign-out on a shared phone). */
+      async forget() { cache.clear(); pending = []; await idb.del(KEY); await idb.del(PKEY); },
       dump() { const obj = {}; for (const [c, m] of cache) obj[c] = Object.fromEntries(m); return clone(obj); },
       pendingCount: () => pending.length,
       flush,
@@ -178,10 +182,10 @@
       async json(prompt, opts = {}) {
         const images = await Promise.all((opts.images || []).map(async b => ({ media_type: b.type || 'image/jpeg', data: await blobToB64(b) })));
         const documents = await Promise.all((opts.documents || []).map(async b => ({ media_type: 'application/pdf', data: await blobToB64(b) })));
-        const out = await call({ task: opts.task || 'log', prompt, images, documents, day: hooks.today ? hooks.today() : undefined }, opts.signal);
+        const out = await call({ task: opts.task || 'log', prompt, images, documents }, opts.signal);
         return out.json;
       },
-      async usage() { const out = await call({ task: 'usage', day: hooks.today ? hooks.today() : undefined }); return out.usage; },
+      async usage() { const out = await call({ task: 'usage' }); if (out.ready === false) throw { code: 'server_config' }; return out.usage; },
       async limits() { return { images: { maxCount: 5 }, pdf: true }; },
     };
   }

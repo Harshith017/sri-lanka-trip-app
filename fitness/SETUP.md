@@ -23,6 +23,8 @@ What you end up with: the app on your own link, sign-in by email code (Google op
    - `DAILY_CAP`: Claude actions per person per day (default 30)
    - `ALLOWED_ORIGIN`: your app's address, so only your page can call the function
    - `MODEL_SMART` / `MODEL_QUICK`: default `claude-sonnet-5` / `claude-haiku-4-5`
+   - `APP_TIMEZONE`: when the daily cap resets (default `Asia/Kolkata`)
+4. Check it: sign in to the app, open **Profile → Account**. "Claude: Connected" means the function and key work; anything else names the problem.
 
 Until this is done the app still works: the built-in food table (130 foods), your saved foods, water, weight and editing all run without Claude. Set `CLAUDE: false` in `config.js` to hide the Claude features until then.
 

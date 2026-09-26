@@ -9,12 +9,15 @@
 //   MODEL_SMART         optional, default claude-sonnet-5
 //   MODEL_QUICK         optional, default claude-haiku-4-5
 //   ALLOWED_ORIGIN      optional, e.g. https://fuel-lift.vercel.app (default *)
+//   APP_TIMEZONE        optional, when the daily cap resets (default Asia/Kolkata)
 // SUPABASE_URL, SUPABASE_ANON_KEY and SUPABASE_SERVICE_ROLE_KEY are provided automatically.
 
 import Anthropic from "npm:@anthropic-ai/sdk";
 import { createClient } from "npm:@supabase/supabase-js@2";
 
-const anthropic = new Anthropic({ apiKey: Deno.env.get("ANTHROPIC_API_KEY") });
+const API_KEY = Deno.env.get("ANTHROPIC_API_KEY");
+const anthropic = API_KEY ? new Anthropic({ apiKey: API_KEY }) : null;
+const TIMEZONE = Deno.env.get("APP_TIMEZONE") ?? "Asia/Kolkata";
 const DAILY_CAP = Number(Deno.env.get("DAILY_CAP") ?? 30);
 const MODEL_SMART = Deno.env.get("MODEL_SMART") ?? "claude-sonnet-5";
 const MODEL_QUICK = Deno.env.get("MODEL_QUICK") ?? "claude-haiku-4-5";
@@ -28,7 +31,7 @@ const TASKS: Record<string, Tier> = {
   coach:      { model: MODEL_SMART, effort: "medium", maxTokens: 16000 }, // sport session calories + recovery
   plan:       { model: MODEL_SMART, effort: "medium", maxTokens: 16000 }, // next session
   review:     { model: MODEL_SMART, effort: "medium", maxTokens: 16000 }, // weekly review
-  report:     { model: MODEL_SMART, effort: "high",   maxTokens: 16000 }, // blood tests
+  report:     { model: MODEL_SMART, effort: "medium", maxTokens: 12000 }, // blood tests (kept under the function time limit)
   ideas:      { model: MODEL_QUICK, maxTokens: 4000 },                    // meal ideas
   questions:  { model: MODEL_QUICK, maxTokens: 4000 },                    // sport profile questions
 };
@@ -75,20 +78,22 @@ Deno.serve(async (req) => {
   const admin = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
 
   let body: {
-    task?: string; prompt?: string; day?: string;
+    task?: string; prompt?: string;
     images?: { media_type: string; data: string }[];
     documents?: { media_type: string; data: string }[];
   };
   try { body = await req.json(); } catch { return fail(400, "bad_request"); }
 
-  // The person's local date, so the cap resets at their midnight, not UTC's.
-  const day = /^\d{4}-\d{2}-\d{2}$/.test(body.day ?? "") ? body.day! : new Date().toISOString().slice(0, 10);
+  // Today's date in the app's time zone. Decided here, never by the page, so
+  // nobody can reset their cap by sending a different date.
+  const day = new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE, year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
 
   if (body.task === "usage") {
     const { data } = await admin.from("ai_usage").select("count").eq("user_id", user.id).eq("day", day).maybeSingle();
-    return reply(200, { ok: true, usage: { count: data?.count ?? 0, cap: DAILY_CAP } });
+    return reply(200, { ok: true, ready: !!anthropic, usage: { count: data?.count ?? 0, cap: DAILY_CAP } });
   }
 
+  if (!anthropic) return fail(500, "server_config");
   const tier = TASKS[body.task ?? ""];
   if (!tier) return fail(400, "bad_task");
   const prompt = String(body.prompt ?? "");

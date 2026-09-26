@@ -84,16 +84,17 @@ const who = date => whoOf(prof(), date);
 
 /* Measured maintenance: energy balance over the last 28 days of full logs. */
 function adaptiveFor(date, p){
-  const key = S.rev+'|'+date;
-  if (S._adapt && S._adapt.key===key) return S._adapt.val;
-  const sums = {};
-  for (const [d, day] of S.days) {
-    if (!(day.foods||[]).length) continue;
-    const t = dayTotals(day);
-    sums[d] = {intake:t.kcal, exerciseNet:t.burned, complete:day.incomplete!==true};
+  if (!S._adapt || S._adapt.rev!==S.rev) {
+    const sums = {};
+    for (const [d, day] of S.days) {
+      if (!(day.foods||[]).length) continue;
+      const t = dayTotals(day);
+      sums[d] = {intake:t.kcal, exerciseNet:t.burned, complete:day.incomplete!==true};
+    }
+    S._adapt = {rev:S.rev, sums, weights:weightPoints(), byDate:{}};
   }
-  const val = Calc.adaptiveMaintenance(sums, weightPoints(), addDays(date,-1), 28, whoOf(p, date).bmrKcal);
-  S._adapt = {key, val}; return val;
+  const A = S._adapt;
+  return A.byDate[date] ||= Calc.adaptiveMaintenance(A.sums, A.weights, addDays(date,-1), 28, whoOf(p, date).bmrKcal);
 }
 
 function computeTargets(p, date){
@@ -1903,7 +1904,7 @@ document.addEventListener('click', ev => {
     case 'authVerify': authVerify(); break;
     case 'authGoogle': authGoogle(); break;
     case 'authBack': S.auth={step:'email', email:S.auth.email, msg:'', busy:false}; render(); break;
-    case 'signOut': if (confirm('Sign out on this device? Anything not yet synced will be lost.')) signOut(); break;
+    case 'signOut': if (confirm(S.db&&S.db.pendingCount() ? `Sign out? ${S.db.pendingCount()} change(s) haven’t synced yet and will be lost.` : 'Sign out on this device? Your data stays in your account.')) signOut(); break;
     case 'exportData': exportData(); break;
     case 'importData': $('#importInput').click(); break;
     case 'refreshUsage': refreshUsage(); break;
@@ -1967,7 +1968,8 @@ function maintenancePanel(){
 function accountPanel(){
   const u = S.usage;
   return `<section class="panel" style="margin-top:16px"><div class="panel-head"><h2>Account</h2><span class="muted small">${esc(S.user?.email||'')}</span></div>
-    <div class="kv" style="max-width:460px"><span>Claude today</span><b>${u?`${u.count} of ${u.cap} used`:'—'}</b><span>Sync</span><b>${{synced:'Up to date',saving:'Saving…',offline:'Offline',error:'Retrying'}[S.sync]||'—'}${S.db&&S.db.pendingCount()?` · ${S.db.pendingCount()} waiting`:''}</b></div>
+    <div class="kv" style="max-width:460px"><span>Claude</span><b>${!S.sample?'Off in config.js':S.aiHealth==='ok'?'Connected':S.aiHealth?`<span style="color:var(--bad)">${esc(S.aiHealth==='unavailable'?'Can’t reach the claude function':AI_ERR[S.aiHealth]||S.aiHealth)}</span>`:'Checking…'}</b>
+      <span>Claude today</span><b>${u?`${u.count} of ${u.cap} used`:'—'}</b><span>Sync</span><b>${{synced:'Up to date',saving:'Saving…',offline:'Offline',error:'Retrying'}[S.sync]||'—'}${S.db&&S.db.pendingCount()?` · ${S.db.pendingCount()} waiting`:''}</b></div>
     <div class="row"><button class="btn ghost sm" data-action="exportData">Download backup</button><button class="btn ghost sm" data-action="importData">Restore from backup</button><span class="spacer"></span><button class="btn ghost sm" data-action="signOut">Sign out</button></div>
     <div class="muted small">A backup is one JSON file with everything: days, profile, foods, reports, plans and reviews. Restoring also accepts an export from the claude.ai version of Fuel &amp; Lift.</div></section>`;
 }
@@ -2026,8 +2028,16 @@ async function authVerify(){
   if (error) { S.auth={...S.auth, busy:false, err:true, msg:'That code didn’t work. It may have expired; send a new one.'}; render(); }
 }
 async function authGoogle(){ await SB.auth.signInWithOAuth({ provider:'google', options:{ redirectTo:redirectTo() } }); }
-async function signOut(){ await SB.auth.signOut(); location.reload(); }
-async function refreshUsage(){ if (S.sample) try { S.usage = await S.sample.usage(); render(); } catch {} }
+async function signOut(){
+  if (S.db) await S.db.forget();
+  await SB.auth.signOut(); location.reload();
+}
+async function refreshUsage(){
+  if (!S.sample) return;
+  try { S.usage = await S.sample.usage(); S.aiHealth = 'ok'; }
+  catch (e) { S.aiHealth = e?.code || 'unavailable'; }
+  render();
+}
 
 async function startFor(user){
   if (S.user && S.user.id===user.id) return;
@@ -2037,7 +2047,7 @@ async function startFor(user){
     onError: code => { if (code==='too_large') toast('One change was too large to sync and was skipped.'); },
   });
   S.db = db;
-  S.sample = FL_CONFIG.CLAUDE !== false ? FL.makeAI(SB, FL_CONFIG, { onUsage: u => { S.usage = u; }, today: localDate }) : null;
+  S.sample = FL_CONFIG.CLAUDE !== false ? FL.makeAI(SB, FL_CONFIG, { onUsage: u => { S.usage = u; } }) : null;
   S.aiState = S.sample ? 'on' : 'off'; S.canPhoto = !!S.sample;
   db.doc('profile/me').onSnapshot(snap => { S.profile = snap.exists ? {...snap.data()} : null; S.rev++;
     if (!S.profile && !S.setupShown && !snap.metadata?.fromCache) { S.setupShown = true; startSetup('about'); return; }

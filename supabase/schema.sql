@@ -61,6 +61,7 @@ returns int language sql security definer set search_path = public as $$
   returning count;
 $$;
 revoke all on function public.bump_ai_usage(uuid, date) from public, anon, authenticated;
+grant execute on function public.bump_ai_usage(uuid, date) to service_role;
 
 -- Gives one back when Claude couldn't be reached, so failures don't use up the cap.
 create or replace function public.refund_ai_usage(p_user uuid, p_day date)
@@ -68,6 +69,7 @@ returns void language sql security definer set search_path = public as $$
   update public.ai_usage set count = greatest(count - 1, 0) where user_id = p_user and day = p_day;
 $$;
 revoke all on function public.refund_ai_usage(uuid, date) from public, anon, authenticated;
+grant execute on function public.refund_ai_usage(uuid, date) to service_role;
 
 -- 4. Invite-only sign-up (optional). Add friends' emails here; leave the
 --    table empty to let anyone who has the link sign up.
