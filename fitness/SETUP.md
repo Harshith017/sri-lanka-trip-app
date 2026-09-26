@@ -4,6 +4,18 @@ About an hour, once. You create the accounts and paste a few keys; everything el
 
 What you end up with: the app on your own link, sign-in by email code (Google optional), each person's logs private to them and synced between phone and laptop, and Claude reading entries through a server function that holds your API key and caps use per person per day.
 
+## Quick setup (recommended)
+
+Create the Supabase project (step 1.1 below), a Supabase access token (Supabase → Account → Access Tokens) and an Anthropic API key (step 2.1). Then one command does everything else in steps 1 and 2:
+
+```
+SUPABASE_ACCESS_TOKEN=... ANTHROPIC_API_KEY=... node supabase/deploy.mjs fuel-lift
+```
+
+It runs the database script, deploys the `claude` function with its secrets, sets up email-code sign-in for the app's address, and writes `config.js`. Commit `config.js`, then do step 3 (hosting). You can delete the access token afterwards.
+
+The manual steps below do the same thing by hand.
+
 ## 1. Supabase project (database + sign-in)
 
 1. Create a free project at [supabase.com](https://supabase.com). Pick the region closest to you (Mumbai for India).
