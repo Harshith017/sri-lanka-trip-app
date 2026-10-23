@@ -193,6 +193,31 @@
   .settle-amt{font-family:'Fraunces',serif;font-size:19px;margin-top:4px;}
   .settle-actions{display:flex;gap:8px;margin-top:9px;flex-wrap:wrap;}
   .bill-mine{color:var(--accent);font-weight:600;}
+  /* ---------- Next-trip planner ---------- */
+  .seg{display:flex;gap:4px;background:var(--paper-2);border-radius:999px;padding:4px;margin:0 0 14px;}
+  .seg-btn{flex:1;border:none;background:none;border-radius:999px;padding:9px 8px;font-weight:700;font-size:13px;color:var(--ink-soft);cursor:pointer;font-family:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .seg-btn.on{background:var(--card);color:var(--ink);box-shadow:0 2px 6px rgba(0,0,0,.08);}
+  .plan-cta{display:flex;align-items:center;gap:12px;cursor:pointer;margin-top:14px;}
+  .plan-cta-ic{font-size:26px;}
+  .plan-hero-t{font-size:14.5px;margin-top:6px;line-height:1.45;}
+  .poll-faces{display:flex;align-items:center;gap:4px;margin-top:12px;flex-wrap:wrap;}
+  .poll-face{width:28px;height:28px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;background:var(--paper-2);color:var(--ink-soft);border:2px dashed var(--line);}
+  .poll-face.done{background:var(--jungle);color:#F6F4E9;border:2px solid var(--jungle);}
+  .dest-card{margin-bottom:10px;}
+  .dest-card.top{border:2px solid var(--brass);}
+  .dest-top{display:flex;gap:12px;align-items:flex-start;}
+  .dest-flag{font-size:30px;line-height:1;}
+  .dest-name{font-weight:800;font-size:17px;}
+  .dest-blurb{font-size:13px;color:var(--ink-soft);margin-top:3px;line-height:1.4;}
+  .dest-match{text-align:center;font-weight:800;font-size:18px;color:var(--accent);line-height:1;}
+  .dest-match span{display:block;font-size:10px;font-weight:600;color:var(--ink-soft);margin-top:2px;}
+  .dest-why{margin-top:10px;font-size:12.5px;color:var(--ink);display:grid;gap:3px;}
+  .dest-facts{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px;}
+  .dest-facts span{background:var(--paper-2);border-radius:999px;padding:4px 9px;font-size:11.5px;font-weight:600;color:var(--ink-soft);}
+  .dest-actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px;}
+  .wish{font-size:13px;padding:6px 0;border-top:1px solid var(--line);}
+  .wish:first-child{border-top:none;}
+  select{width:100%;padding:11px 12px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--ink);font-family:inherit;}
   .tappable{cursor:pointer;}
   .tappable:active{background:var(--paper-2);}
   .row-chev{color:var(--ink-soft);font-size:20px;margin-left:4px;opacity:.6;}
@@ -349,7 +374,9 @@
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
 <script src="firebase-config.js"></script>
-<script src="app.js"></script>
+<script src="planner-data.js?v=2"></script>
+<script src="app.js?v=2"></script>
+<script src="planner.js?v=2"></script>
 <script>
   // Lets the app open with no signal (see sw.js). Skipped when testing from a file.
   if("serviceWorker" in navigator && location.protocol === "https:"){

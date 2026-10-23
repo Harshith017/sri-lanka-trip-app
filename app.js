@@ -1,53 +1,8 @@
 /* ====================== Trip content ====================== */
 
-var SEED_ITINERARY = [
-  { day:1, date:"17 Nov", weekday:"Tuesday", stay:"Kandy", title:"Colombo Airport → Kandy",
-    items:[["Morning","Depart Bangalore, land in Colombo, pick up the rental car"],
-           ["Morning","Drive to Kandy — about 3–3.5 hrs"],["1:30 PM","Lunch"],
-           ["2:30 PM","Temple of the Sacred Tooth Relic"],["4:00 PM","Kandy Lake"],
-           ["5:00 PM","Bahirawakanda Buddha viewpoint"],["6:00 PM","Explore Kandy town"],
-           ["7:30 PM","Dinner"],["9:00 PM","Hotel / relax"]],
-    tip:"Keep it an early night — hill country driving tomorrow." },
-  { day:2, date:"18 Nov", weekday:"Wednesday", stay:"Nuwara Eliya", title:"Kandy → Nuwara Eliya",
-    items:[["8:00 AM","Breakfast, then checkout"],["—","Drive to Nuwara Eliya — about 2.5–3 hrs"],
-           ["11:30 AM","Arrive, tea plantation + tea factory"],["1:30 PM","Lunch"],
-           ["2:30 PM","Gregory Lake"],["4:00 PM","Victoria Park"],
-           ["5:00 PM","Explore town / colonial area"],["7:30 PM","Dinner"],["9:30 PM","Sleep"]],
-    tip:"Tea country and a relaxed hill-station day — one night here is enough." },
-  { day:3, date:"19 Nov", weekday:"Thursday", stay:"Ella (night 1 of 2)", title:"Nuwara Eliya → Ella",
-    items:[["8:00 AM","Breakfast"],
-           ["8:30 AM","Choose one: tea estate / Lover's Leap Waterfall / Ramboda Falls / a relaxed café"],
-           ["10:30 AM","Checkout"],["—","Drive to Ella — about 2–2.5 hrs"],
-           ["1:00 PM","Arrive, lunch, hotel check-in"],
-           ["3:00 PM","Nine Arch Bridge ⭐⭐⭐⭐⭐ and Little Adam's Peak ⭐⭐⭐⭐"],
-           ["6:00 PM","Back to hotel"],["7:30 PM","Dinner, then relax"]], tip:"" },
-  { day:4, date:"20 Nov", weekday:"Friday", stay:"Ella (night 2 of 2)", title:"Full Ella day",
-    items:[["8:30 AM","Breakfast"],
-           ["9:30 AM","Ella Rock (proper hike) or Ravana Falls + viewpoints (easier)"],
-           ["12:30 PM","Lunch"],["2:00 PM","Ella town — cafés, shopping, spa, relax at the hotel"],
-           ["7:30 PM","Dinner, then drinks"],["10:00 PM","Ella bar hopping — backpacker/social scene"]], tip:"" },
-  { day:5, date:"21 Nov", weekday:"Saturday", stay:"Mirissa", title:"Ella → Mirissa",
-    items:[["10:00 AM","Wake up (later start after Friday night), breakfast"],
-           ["11:30 AM","Checkout, leave Ella"],["—","Drive to Mirissa — about 3.5–4.5 hrs"],
-           ["4:30 PM","Arrive, check in"],["5:30 PM","Mirissa Beach, sunset, Coconut Tree Hill"],
-           ["7:30 PM","Dinner"],["9:00 PM","Beach bars — the main party night"]],
-    tip:"If you're drinking, leave the rental car at the hotel and use tuk-tuks or taxis." },
-  { day:6, date:"22 Nov", weekday:"Sunday", stay:"Colombo", title:"Mirissa → Galle → Colombo",
-    items:[["10:00 AM","Wake up, breakfast"],
-           ["11:30 AM","Beach time — pick 1–2: surfing, snorkelling, kayaking, swimming"],
-           ["1:30 PM","Lunch, then leave Mirissa"],["—","Drive to Galle — about 1–1.5 hrs"],
-           ["4:00 PM","Galle Fort — walls, lighthouse, colonial streets, cafés, shopping"],
-           ["6:30 PM","Sunset at the Fort"],["8:30 PM","Dinner, then leave for Colombo"],
-           ["—","Drive to Colombo — about 2–2.5 hrs"],["~12:00 AM","Arrive Colombo"]],
-    tip:"Your biggest combined day — pace it and don't try to do everything on the beach." },
-  { day:7, date:"23 Nov", weekday:"Monday", stay:"Departure", title:"Colombo → Departure",
-    items:[["Morning","Sightsee in Colombo"],["Afternoon","Departure flight to Bangalore"]], tip:"" }
-];
-
-// [route, duration, trip day it happens on]
-var DRIVE_LEGS = [["Airport → Kandy","~3–3.5h",1],["Kandy → N'Eliya","~2.5–3h",2],
-  ["N'Eliya → Ella","~2–2.5h",3],["Ella → Mirissa","~3.5–4.5h",5],
-  ["Mirissa → Galle","~1–1.5h",6],["Galle → Colombo","~2–2.5h",6]];
+/* ====================== Trip content ======================
+   There's no built-in trip any more: the group starts with the holiday
+   poll (planner.js), and the plan they lock in becomes the trip. */
 
 var CATEGORIES = [
   {id:"flights",label:"Flights",icon:"✈️"},
@@ -60,15 +15,43 @@ var VALID_CATEGORIES = CATEGORIES.map(function(c){ return c.id; });
 var MAX_DESC_LEN = 80, MAX_NAME_LEN = 40, MAX_UPI_LEN = 60, MAX_AMOUNT = 10000000;
 
 /* ---- Trip settings (shared, editable in the app) ----
-   Stored in Firestore at trip/settings. These defaults come from the
-   Sri_Lanka_Plan spreadsheet (6 adults) and are used until someone saves. */
+   Stored in Firestore at trip/settings. Until the group locks in a trip
+   from the poll there is no trip (tripId ""), and the app shows the planner. */
 var DEFAULT_SETTINGS = {
-  startDate: "2026-11-17",
-  endDate:   "2026-11-23",
-  airportRate: null,            // LKR you get for ₹1 at the airport counter, e.g. 3.40
-  budget: { flights:168000, stay:34300, food:58800, transport:53500, activity:0, shopping:0, other:0 }
+  startDate: "2026-01-01",
+  endDate:   "2026-01-01",
+  airportRate: null,            // foreign currency you get for ₹1 at the airport counter
+  budget: { flights:0, stay:0, food:0, transport:0, activity:0, shopping:0, other:0 },
+  tripId: "",
+  title: "",
+  country: "",
+  currency: "INR",
+  route: "",
+  legs: []
 };
+// Bills saved before trips were tracked belong to this old trip id.
+var LEGACY_TRIP_ID = "srilanka-2026";
+function hasTrip(){ return !!S.settings.tripId; }
 function cloneSettings(x){ return JSON.parse(JSON.stringify(x)); }
+function tripTitle(){ return S.settings.title || "the trip"; }
+function tripCountry(){ return S.settings.country || ""; }
+/** The trip's foreign currency, or "INR" for a trip inside India. */
+function tripCur(){ var c = S.settings.currency; return (c && typeof CURRENCY_INFO !== "undefined" && CURRENCY_INFO[c]) ? c : (c === "LKR" ? "LKR" : "INR"); }
+function knownCur(c){ return (typeof CURRENCY_INFO !== "undefined") ? !!CURRENCY_INFO[c] : (c === "LKR" || c === "INR"); }
+function isForeign(cur){ return !!cur && cur !== "INR"; }
+function curInfo(cur){
+  if(typeof CURRENCY_INFO !== "undefined" && CURRENCY_INFO[cur]) return CURRENCY_INFO[cur];
+  return cur === "LKR" ? { sym:"Rs", name:"Sri Lankan rupee", ref:3.4 } : { sym:cur, name:cur, ref:1 };
+}
+/** [label, time, day] for the "drive times" strip. */
+function tripLegs(){
+  if(!Array.isArray(S.settings.legs)) return [];
+  return S.settings.legs.map(function(l){ return [String(l.l||""), String(l.t||""), Number(l.d)||0]; }).filter(function(l){ return l[0]; });
+}
+/** Which trip a bill belongs to (bills from before trips existed are the first trip). */
+/** Bills added while no trip was picked yet (advances, bookings) join whichever trip comes next. */
+function billTrip(b){ return b.trip == null ? LEGACY_TRIP_ID : (b.trip || S.settings.tripId); }
+function tripBills(){ return S.bills.filter(function(b){ return billTrip(b) === S.settings.tripId; }); }
 
 var MONTH_SHORT = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 var WEEKDAY_LONG = ["Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"];
@@ -104,23 +87,46 @@ function isDuringTrip(){
    when saved, and the rate used is stored on the bill so every phone shows
    the same number (rates are never silently re-fetched later).
    Rates are "LKR per ₹1" (≈3.45), which is how money-changers quote them. */
-function fmtLkr(v){
+function fmtCur(v, cur){
   var n = round2(v), frac = Math.round(Math.abs(n)*100) % 100 !== 0;
-  return "LKR " + Number(n).toLocaleString("en-US", { minimumFractionDigits: frac ? 2 : 0, maximumFractionDigits: 2 });
+  return cur + " " + Number(n).toLocaleString("en-US", { minimumFractionDigits: frac ? 2 : 0, maximumFractionDigits: 2 });
 }
-function money(v, cur){ return cur === "LKR" ? fmtLkr(v) : inr(v); }
-function curSymbol(cur){ return cur === "LKR" ? "Rs" : "₹"; }
+function fmtLkr(v){ return fmtCur(v, "LKR"); }
+function money(v, cur){ return isForeign(cur) ? fmtCur(v, cur) : inr(v); }
+function curSymbol(cur){ return isForeign(cur) ? curInfo(cur).sym : "₹"; }
 function inrWhole(v){ return inr(Math.round(Number(v)||0)); }
-function lkrToInr(v, lkrPerInr){ return round2(Number(v) / Number(lkrPerInr)); }
-function validRate(r){ r = Number(r); return isFinite(r) && r >= 0.5 && r <= 50; }
+function lkrToInr(v, perInr){ return round2(Number(v) / Number(perInr)); }
+/** A rate is "units of the foreign currency for ₹1". Sanity-checked against
+    a rough reference so a typo (or the wrong currency) can't slip through. */
+function validRate(r, cur){
+  r = Number(r); if(!isFinite(r) || r <= 0) return false;
+  var ref = curInfo(cur || tripCur()).ref;
+  return r >= ref/5 && r <= ref*5;
+}
+/** Rates are shown the way money-changers quote them: "₹1 = 3.4 LKR" for
+    currencies worth less than a rupee, "1 AED = ₹23.8" for the rest. */
+function rateFlipped(cur){ return curInfo(cur).ref < 1; }
+function rateText(rate, cur){
+  if(!rate) return "";
+  return rateFlipped(cur) ? ("1 " + cur + " = ₹" + (Math.round(100/rate)/100)) : ("₹1 = " + (Math.round(rate*10000)/10000) + " " + cur);
+}
+function rateToInput(rate, cur){ return rate ? (rateFlipped(cur) ? Math.round(10000/rate)/10000 : rate) : ""; }
+function inputToRate(v, cur){ v = parseFloat(v); if(!(v > 0)) return null; return Math.round((rateFlipped(cur) ? 1/v : v) * 1e8) / 1e8; }
+function rateInputHtml(id, cur, width){
+  return rateFlipped(cur)
+    ? '1 '+cur+' = ₹ <input type="number" inputmode="decimal" step="0.01" id="'+id+'" class="split-input" style="width:'+width+'px;" placeholder="'+(Math.round(100/curInfo(cur).ref)/100)+'">'
+    : '₹1 = <input type="number" inputmode="decimal" step="0.01" id="'+id+'" class="split-input" style="width:'+width+'px;" placeholder="'+curInfo(cur).ref+'"> '+cur;
+}
 
 var fxMem = {};
 /** Market rate for a date (YYYY-MM-DD). Free, no key; two mirrors; cached
     on the phone so previously-seen dates work offline. Today/future → latest. */
-function fetchLkrPerInr(ymd){
+function fetchLkrPerInr(ymd){ return fetchRate(tripCur(), ymd); }
+function fetchRate(cur, ymd){
   var tag = (!ymd || ymd >= todayYmd()) ? "latest" : ymd;
-  var cacheKey = "pw_fx_" + tag;
-  if(fxMem[tag] && (tag !== "latest" || Date.now() - fxMem[tag].at < 3*3600e3)) return Promise.resolve(fxMem[tag]);
+  var cacheKey = cur === "LKR" ? ("pw_fx_" + tag) : ("pw_fx_" + cur + "_" + tag);
+  var memKey = cur + "|" + tag;
+  if(fxMem[memKey] && (tag !== "latest" || Date.now() - fxMem[memKey].at < 3*3600e3)) return Promise.resolve(fxMem[memKey]);
   var urls = [
     "https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@"+tag+"/v1/currencies/inr.json",
     "https://"+tag+".currency-api.pages.dev/v1/currencies/inr.json"
@@ -128,7 +134,7 @@ function fetchLkrPerInr(ymd){
   function attempt(i){
     if(i >= urls.length){
       var cached = null; try{ cached = JSON.parse(lsGet(cacheKey) || "null"); }catch(e){}
-      if(cached && validRate(cached.rate)) return cached;
+      if(cached && validRate(cached.rate, cur)) return cached;
       throw new Error("Couldn't get the exchange rate (no signal?)");
     }
     var ctrl = (typeof AbortController !== "undefined") ? new AbortController() : null;
@@ -136,10 +142,10 @@ function fetchLkrPerInr(ymd){
     return fetch(urls[i], ctrl ? { signal: ctrl.signal } : undefined).then(function(r){
       if(timer) clearTimeout(timer); if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
       .then(function(j){
-        var rate = j && j.inr && Number(j.inr.lkr);
-        if(!validRate(rate)) throw new Error("bad rate");
-        var out = { rate: Math.round(rate*10000)/10000, date: String(j.date||ymd||""), at: Date.now() };
-        fxMem[tag] = out;
+        var rate = j && j.inr && Number(j.inr[cur.toLowerCase()]);
+        if(!validRate(rate, cur)) throw new Error("bad rate");
+        var out = { rate: Math.round(rate*1e6)/1e6, date: String(j.date||ymd||""), at: Date.now() };
+        fxMem[memKey] = out;
         lsSet(cacheKey, JSON.stringify(out));
         return out;
       })
@@ -233,21 +239,25 @@ function stayTown(stay){
   var t = cleanPlace(stay);
   return /^(departure|—|-|tbd)?$/i.test(t) ? "" : t;
 }
-function mapsUrl(place, town){
+function mapsUrl(place, town, country){
   var p = cleanPlace(place);
+  country = country != null ? country : tripCountry();
+  var hasC = function(x){ return !country || x.toLowerCase().indexOf(country.toLowerCase()) >= 0; };
   var drive = /^(drive|head|transfer|go)\s+(back\s+)?to\s+(.+)$/i.exec(p);
   var ctx = function(x){
     var q = x;
     if(town && q.toLowerCase().indexOf(town.toLowerCase()) < 0) q += ", " + town;
-    if(!/sri lanka/i.test(q)) q += ", Sri Lanka";
+    if(!hasC(q)) q += ", " + country;
     return q;
   };
-  if(drive) return "https://www.google.com/maps/dir/?api=1&destination=" + encodeURIComponent(drive[3] + (/sri lanka/i.test(drive[3]) ? "" : ", Sri Lanka"));
+  if(drive) return "https://www.google.com/maps/dir/?api=1&destination=" + encodeURIComponent(drive[3] + (hasC(drive[3]) ? "" : ", " + country));
   return "https://www.google.com/maps/search/?api=1&query=" + encodeURIComponent(ctx(p));
 }
-function mapsBtnHtml(place, extraStyle, town){
-  if(!cleanPlace(place)) return "";
-  return '<a class="map-pin" href="'+esc(mapsUrl(place, town))+'" target="_blank" rel="noopener" '+
+/** Plan lines that aren't a place you'd look up on a map. */
+var NOT_A_PLACE = /^(check in|fly |travel |dinner: try|try |breakfast|free day|slow morning|explore .* at your own pace|head home|head back|last-minute|rest\b)/i;
+function mapsBtnHtml(place, extraStyle, town, country){
+  if(!cleanPlace(place) || NOT_A_PLACE.test(String(place).trim())) return "";
+  return '<a class="map-pin" href="'+esc(mapsUrl(place, town, country))+'" target="_blank" rel="noopener" '+
     'title="Open in Maps" onclick="event.stopPropagation()" style="'+(extraStyle||"")+'">📍</a>';
 }
 
@@ -474,7 +484,9 @@ function validateBillCore(payload, peopleEmails){
 
   var amount = round2(payload && payload.amount);
   if(!isFinite(amount) || amount<=0) throw new Error("Enter an amount greater than zero.");
-  if(amount > MAX_AMOUNT) throw new Error("That amount looks too large — check the digits.");
+  // The cap is in ₹: a 12,000,000 rupiah villa is only about ₹64k.
+  var capRate = (payload && isForeign(payload.currency) && payload.fx && Number(payload.fx.rate) > 1) ? Number(payload.fx.rate) : 1;
+  if(amount / capRate > MAX_AMOUNT) throw new Error("That amount looks too large — check the digits.");
 
   var rawSplit = (payload && payload.split) || [];
   if(!Array.isArray(rawSplit)) rawSplit = [];
@@ -526,12 +538,12 @@ function validateBill(payload, peopleEmails){
   var out = validateBillCore(payload, peopleEmails);
   var billDate = ymdToDate(payload && payload.billDate) ? payload.billDate : todayYmd();
   out.billDate = billDate;
-  var cur = (payload && payload.currency === "LKR") ? "LKR" : "INR";
+  var cur = (payload && isForeign(payload.currency) && knownCur(payload.currency)) ? payload.currency : "INR";
   out.currency = cur;
   if(cur === "INR"){ out.origAmount = null; out.fx = null; return out; }
 
   var fx = payload.fx || {};
-  if(!validRate(fx.rate)) throw new Error("Set the exchange rate first (LKR for ₹1).");
+  if(!validRate(fx.rate, cur)) throw new Error("Set the exchange rate first ("+cur+").");
   var rate = Number(fx.rate);
   out.fx = { rate: rate, source: (["day","airport","manual"].indexOf(fx.source) >= 0 ? fx.source : "manual"), date: String(fx.date || billDate) };
 
@@ -661,7 +673,15 @@ function rebuildState(){
     var d = doc.data();
     if(ymdToDate(d.startDate)) settings.startDate = d.startDate;
     if(ymdToDate(d.endDate) && d.endDate >= settings.startDate) settings.endDate = d.endDate;
-    settings.airportRate = validRate(d.airportRate) ? Number(d.airportRate) : null;
+    if(typeof d.tripId === "string" && d.tripId){
+      settings.tripId = d.tripId;
+      settings.title = cleanText(d.title, 40) || "Trip";
+      settings.country = cleanText(d.country, 40);
+      settings.currency = knownCur(d.currency) ? d.currency : "INR";
+      settings.route = cleanText(d.route, 200);
+      settings.legs = Array.isArray(d.legs) ? d.legs.filter(function(l){ return l && typeof l === "object"; }).slice(0, 12) : [];
+    }
+    settings.airportRate = (isForeign(settings.currency) && validRate(d.airportRate, settings.currency)) ? Number(d.airportRate) : null;
     if(d.budget && typeof d.budget === "object"){
       CATEGORIES.forEach(function(c){
         if(!(c.id in d.budget)) return;   // keep the default for categories added later
@@ -706,9 +726,10 @@ function rebuildState(){
       splitShares: d.splitShares || null,
       items: Array.isArray(d.items) ? d.items.map(cleanStoredItem).filter(Boolean) : null,
       extras: Array.isArray(d.extras) ? d.extras.map(cleanStoredExtra).filter(Boolean) : null,
-      currency: d.currency === "LKR" ? "LKR" : "INR",
-      origAmount: (d.currency === "LKR" && Number(d.origAmount) > 0) ? Number(d.origAmount) : null,
-      fx: (d.currency === "LKR" && d.fx && validRate(d.fx.rate)) ? d.fx : null,
+      currency: (isForeign(d.currency) && knownCur(d.currency)) ? d.currency : "INR",
+      origAmount: (isForeign(d.currency) && knownCur(d.currency) && Number(d.origAmount) > 0) ? Number(d.origAmount) : null,
+      fx: (isForeign(d.currency) && knownCur(d.currency) && d.fx && validRate(d.fx.rate, d.currency)) ? d.fx : null,
+      trip: typeof d.trip === "string" ? d.trip : null,
       billDate: ymdToDate(d.billDate) ? d.billDate : (tsToIso(d.createdAt) ? dateToYmd(new Date(tsToIso(d.createdAt))) : ""),
       addedBy: normEmail(d.addedBy)
     });
@@ -731,13 +752,7 @@ function rebuildState(){
   });
 
   var itinerary = [];
-  if(itinerarySnap.empty){
-    // Nobody has synced the itinerary yet — fall back to the built-in seed
-    // data so the app still works, and seed Firestore once so edits persist.
-    itinerary = SEED_ITINERARY.slice();
-    // Only members may write it, so wait until this person has joined.
-    if(people.some(function(p){ return p.email === S.me; }) && !fromCacheOnly(itinerarySnap)) seedItineraryOnce();
-  } else {
+  {
     itinerarySnap.forEach(function(doc){
       var d = doc.data();
       itinerary.push({
@@ -785,6 +800,7 @@ function rebuildState(){
   // approves join requests. Rules only allow creating this list once.
   if(joined && admins === null && !fromCacheOnly(tripSnap)) ensureAdmins();
   if(joined && isAdmin()) startRequestsListener(); else stopRequestsListener();
+  if(typeof plannerStart === "function"){ if(joined) plannerStart(); else plannerStop(); }
   if(!booted){
     if(!joined){
       // Only draw the join form once — later snapshots (other people adding
@@ -905,22 +921,6 @@ function restartListeners(){
   startListeners();
 }
 
-function seedItineraryOnce(){
-  if(itinerarySeeded) return;
-  itinerarySeeded = true;
-  var batch = db.batch();
-  SEED_ITINERARY.forEach(function(d){
-    var ref = db.collection("itinerary").doc("day" + d.day);
-    batch.set(ref, {
-      day: d.day, date: d.date, weekday: d.weekday, stay: d.stay,
-      title: d.title, items: itemsToFirestore(d.items), tip: d.tip||""
-    }, { merge:true });
-  });
-  batch.commit().catch(function(err){
-    console.warn("Itinerary seed failed, will retry:", err && err.code);
-    itinerarySeeded = false;   // try again on the next snapshot (e.g. after joining)
-  });
-}
 
 function startListeners(){
   if(unsubPeople) return;   // already listening
@@ -1067,6 +1067,7 @@ function addBill(payload){
       items: bill.items || null,
       extras: bill.extras && bill.extras.length ? bill.extras : null,
       currency: bill.currency, origAmount: bill.origAmount, fx: bill.fx, billDate: bill.billDate,
+      trip: S.settings.tripId || "",
       createdAt: firebase.firestore.FieldValue.serverTimestamp(),
       updatedAt: firebase.firestore.FieldValue.serverTimestamp(),
       deleted: false
@@ -1155,7 +1156,7 @@ function buildShell(){
     '<header class="topbar">'+
       '<div class="topbar-row"><h1 class="trip-title"><img class="logo-sm" src="icon-192.png" alt="">Project W</h1>'+
       '<button class="hdr-gear" data-action="trip-settings" aria-label="Trip settings" title="Trip settings">⚙️</button></div>'+
-      '<div class="route-line">Colombo Airport → Kandy → Nuwara Eliya → Ella → Mirissa → Galle → Colombo</div>'+
+      '<div class="route-line" id="route-line"></div>'+
       '<div class="whoami">'+
         '<span class="me"><span class="sync-dot" id="sync-dot"></span><span id="me-label"></span></span>'+
         '<button id="btn-profile">Edit</button>'+
@@ -1203,9 +1204,11 @@ function render(){
   if(!booted) return;
   var me = person(S.me);
   document.getElementById("me-label").textContent = me.name + (me.upi ? " · " + me.upi : "");
+  var rl = document.getElementById("route-line");
+  if(rl) rl.textContent = hasTrip() ? (S.settings.route || tripTitle()) : "Planning the next holiday ✨";
 
   var v = document.getElementById("view");
-  if(activeTab==="now") v.innerHTML = requestsCardHtml() + viewNow();
+  if(activeTab==="now") v.innerHTML = requestsCardHtml() + (hasTrip() ? viewNow() + (typeof plannerNowCard === "function" ? plannerNowCard() : "") : viewNoTrip());
   else if(activeTab==="itinerary") v.innerHTML = viewItinerary();
   else if(activeTab==="balances") v.innerHTML = requestsCardHtml() + viewBalances();
   else if(activeTab==="bills") v.innerHTML = viewBills();
@@ -1218,14 +1221,14 @@ function render(){
 function budgetChipHtml(){
   var b = budgetSummary();
   return '<div class="now-chip" data-action="goto-plan" style="cursor:pointer;"><div class="nc-k">Trip spend</div>'+
-    '<div class="nc-v'+(b.budget>0 && b.spent>b.budget?' neg':'')+'">'+inrWhole(b.spent)+'<span class="muted" style="font-size:12px;font-weight:500;"> / '+inrWhole(b.budget)+'</span></div>'+
-    barHtml(b.spent, b.budget)+'</div>';
+    '<div class="nc-v'+(b.budget>0 && b.spent>b.budget?' neg':'')+'">'+inrWhole(b.spent)+'<span class="muted" style="font-size:12px;font-weight:500;"> / '+(b.budget > 0 ? inrWhole(b.budget) : 'no budget yet')+'</span></div>'+
+    (b.budget > 0 ? barHtml(b.spent, b.budget) : '')+'</div>';
 }
 
 /** What the group (and you) spent today — handy for "how are we doing". */
 function todayChipHtml(){
   var t = todayYmd(), g = 0, mine = 0, n = 0;
-  S.bills.forEach(function(b){ if(b.billDate === t){ n++; g += b.amount; mine += Number(billShares(b)[S.me]) || 0; } });
+  tripBills().forEach(function(b){ if(b.billDate === t){ n++; g += b.amount; mine += Number(billShares(b)[S.me]) || 0; } });
   return '<div class="now-chip" data-action="goto-bills" style="cursor:pointer;"><div class="nc-k">Spent today</div>'+
     '<div class="nc-v">'+inrWhole(g)+'</div><div class="muted" style="font-size:11.5px;margin-top:2px;">'+
     (n ? 'your share '+inrWhole(mine)+' · '+n+' bill'+(n===1?'':'s') : 'no bills yet today')+'</div></div>';
@@ -1268,10 +1271,10 @@ function viewNow(){
 
   // Trip finished.
   if(tripEnd && now >= tripEnd){
-    var total = S.bills.reduce(function(s,b){ return s+b.amount; }, 0);
+    var tb = tripBills(), total = tb.reduce(function(s,b){ return s+b.amount; }, 0);
     return '<div class="card now-hero">'+
         '<div class="now-hero-lbl">🎉 Trip complete</div>'+
-        '<div class="now-hero-sub">'+inr(total)+' logged across '+S.bills.length+' bill'+(S.bills.length===1?"":"s")+'</div>'+
+        '<div class="now-hero-sub">'+inr(total)+' logged across '+tb.length+' bill'+(tb.length===1?"":"s")+'</div>'+
       '</div>'+
       '<div class="now-chips">'+balChip+budgetChipHtml()+'</div>'+
       '<div class="muted" style="font-size:12.5px;padding:10px 2px;">Head to Settle to clear any last balances.</div>';
@@ -1300,8 +1303,8 @@ function viewNow(){
     ? '<div class="now-hero-lbl">Up next</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(nextItem.it[1])+mapsBtnHtml(nextItem.it[1],"margin-left:6px;", stayTown(d.stay))+'</div><div class="now-hero-time">'+esc(nextItem.it[0])+'</div>'
     : '<div class="now-hero-lbl">Today</div><div class="now-hero-sub" style="font-size:17px;font-weight:600;">'+esc(d.title)+'</div>';
 
-  var todaysLegs = DRIVE_LEGS.filter(function(l){ return l[2] === d.day; });
-  var nextLeg = DRIVE_LEGS.filter(function(l){ return l[2] > d.day; })[0];
+  var todaysLegs = tripLegs().filter(function(l){ return l[2] === d.day; });
+  var nextLeg = tripLegs().filter(function(l){ return l[2] > d.day; })[0];
   var legChip = todaysLegs.length
     ? '<div class="now-chip"><div class="nc-k">Today\'s drive</div><div class="nc-v" style="font-size:13.5px;">'+
         todaysLegs.map(function(l){ return esc(l[0])+' · '+esc(l[1]); }).join('<br>')+'</div></div>'
@@ -1325,8 +1328,17 @@ function viewNow(){
     (d.tip ? '<div class="day-tip" style="margin:10px 2px;">📝 '+esc(d.tip)+'</div>' : '');
 }
 
+/** Now tab before any trip is chosen: straight into the poll. */
+function viewNoTrip(){
+  if(typeof viewPlanner !== "function") return '<div class="empty"><span class="big">🧭</span>Loading…</div>';
+  return viewPlanner();
+}
+
 function viewItinerary(){
-  var legs = DRIVE_LEGS.map(function(l){
+  var hasPlanner = typeof viewPlanner === "function";
+  if(!hasTrip()) return hasPlanner ? viewPlanner() : '<div class="empty"><span class="big">🗓️</span>No trip yet</div>';
+  if(hasPlanner && planMode === "next") return planToggleHtml() + viewPlanner();
+  var legs = tripLegs().map(function(l){
     return '<div class="ref-chip"><div class="k">'+esc(l[0])+'</div><div class="v">'+esc(l[1])+'</div></div>';
   }).join("");
   var days = S.itinerary.map(function(d){
@@ -1347,13 +1359,14 @@ function viewItinerary(){
       '<div class="day-body"><div class="day-body-in">'+items+tip+editBtn+'</div></div></div>';
   }).join("");
 
-  return '<div class="plan-top">'+
+  return (hasPlanner ? planToggleHtml() : '') +
+         '<div class="plan-top">'+
            '<div><div class="plan-dates">'+esc(tripRangeLabel())+' · '+S.itinerary.length+' day'+(S.itinerary.length===1?'':'s')+'</div>'+
-           '<div class="muted" style="font-size:12px;">Dates, budget and airport rate live in Trip settings</div></div>'+
+           '<div class="muted" style="font-size:12px;">Dates, budget'+(isForeign(tripCur()) ? ' and airport rate' : '')+' live in Trip settings</div></div>'+
            '<button class="btn btn-ghost btn-sm" data-action="trip-settings">⚙️ Trip settings</button>'+
          '</div>'+
          viewBudgetCard()+
-         '<div class="section-label">Drive times</div><div class="ref-scroller">'+legs+'</div>'+
+         (legs ? '<div class="section-label">'+"Getting around"+'</div><div class="ref-scroller">'+legs+'</div>' : '')+
          '<div class="section-label">Day by day</div>'+days;
 }
 
@@ -1362,7 +1375,7 @@ function viewItinerary(){
 function spendByCategory(){
   var m = {};
   CATEGORIES.forEach(function(c){ m[c.id] = 0; });
-  S.bills.forEach(function(b){
+  tripBills().forEach(function(b){
     var k = m.hasOwnProperty(b.category) ? b.category : "other";
     m[k] = round2(m[k] + b.amount);
   });
@@ -1374,7 +1387,7 @@ function budgetSummary(){
   var spent = 0, budget = 0;
   CATEGORIES.forEach(function(c){ spent += sp[c.id]; budget += Number(bud[c.id]) || 0; });
   var mine = 0;
-  S.bills.forEach(function(b){ mine += Number(billShares(b)[S.me]) || 0; });
+  tripBills().forEach(function(b){ mine += Number(billShares(b)[S.me]) || 0; });
   return { byCat: sp, spent: round2(spent), budget: round2(budget), mine: round2(mine) };
 }
 
@@ -1414,19 +1427,48 @@ function saveTripSettings(data){
     if(!a || !b) throw new Error("Pick both a start and an end date.");
     if(b < a) throw new Error("The trip can't end before it starts.");
     if(Math.round((b - a) / 86400000) + 1 > 30) throw new Error("Keep the trip to 30 days or fewer.");
-    if(data.airportRate != null && !validRate(data.airportRate)) throw new Error("Airport rate should be the LKR you get for ₹1 — something like 3.4.");
-    return db.collection("trip").doc("settings").set({
+    var cur = (data.currency && knownCur(data.currency)) ? data.currency : tripCur();
+    if(!isForeign(cur)) data.airportRate = null;
+    if(data.airportRate != null && !validRate(data.airportRate, cur)) throw new Error("That airport rate looks off — "+cur+" is usually around "+rateText(curInfo(cur).ref, cur)+".");
+    var extra = {};
+    if(data.country != null){
+      var c = cleanText(data.country, 40);
+      if(!c) throw new Error("Add the country you're going to.");
+      extra.country = c; extra.currency = cur;
+    }
+    return db.collection("trip").doc("settings").set(Object.assign(extra, {
       startDate: data.startDate,
       endDate: data.endDate,
-      airportRate: data.airportRate == null ? null : Math.round(Number(data.airportRate) * 10000) / 10000,
+      airportRate: data.airportRate == null ? null : Math.round(Number(data.airportRate) * 1e8) / 1e8,
       budget: data.budget,
       updatedBy: S.me,
       updatedAt: firebase.firestore.FieldValue.serverTimestamp()
-    }, { merge:true });
+    }), { merge:true });
   } catch(e){ return Promise.reject(e); }
 }
 
+function shareInvite(){
+  var link = appLink(), text = "Join our " + (hasTrip() ? tripTitle() + " trip" : "holiday planning") + " on Project W — open the link, sign in with Google and tap Ask to join.";
+  if(navigator.share){
+    navigator.share({ title:"Project W", text:text, url:link }).catch(function(){});
+  } else if(navigator.clipboard){
+    navigator.clipboard.writeText(text+"\n"+link).then(function(){ toast("Link copied"); }, function(){ toast(link); });
+  } else toast(link);
+}
+
 function openTripSettingsSheet(){
+  if(!hasTrip()){
+    openSheetHtml(
+      '<h3>Trip settings</h3>'+
+      '<div class="field"><label>Invite friends</label>'+
+        '<div class="invite-box"><div class="muted" style="font-size:13px;">They open the link, sign in with Google and ask to join. '+
+          (isAdmin() ? 'You approve them.' : 'The organiser approves them.')+'</div>'+
+          '<button class="btn btn-brand btn-sm" id="ts-share" style="flex:0 0 auto;">Share link</button></div></div>'+
+      '<div class="day-tip" style="font-style:normal;">No trip yet. Take the holiday poll and lock in a destination — dates, country, currency and budget show up here once it’s your trip.</div>',
+      function(el){ el.querySelector("#ts-share").addEventListener("click", shareInvite); }
+    );
+    return;
+  }
   var st = S.settings, bud = st.budget || {};
   var budRows = CATEGORIES.map(function(c){
     return '<div class="split-row"><span style="flex:1;font-size:13.5px;">'+c.icon+' '+esc(c.label)+'</span>'+
@@ -1445,9 +1487,15 @@ function openTripSettingsSheet(){
       '<div class="field" style="flex:1;"><label>Trip ends</label><input type="date" id="ts-end" value="'+esc(st.endDate)+'"></div>'+
     '</div>'+
     '<div class="split-hint" id="ts-len" style="margin:-6px 0 14px;"></div>'+
-    '<div class="field"><label>Airport exchange rate</label>'+
-      '<div class="fx-line">₹1 = <input type="number" inputmode="decimal" step="0.01" id="ts-rate" class="split-input" style="width:90px;" value="'+(st.airportRate || "")+'" placeholder="e.g. 3.40"> LKR</div>'+
-      '<div class="split-hint" id="ts-market">Checking today\'s market rate…</div></div>'+
+    '<div style="display:flex;gap:10px;">'+
+      '<div class="field" style="flex:1;min-width:0;"><label>Country</label><input type="text" id="ts-country" maxlength="40" list="ts-countries" value="'+esc(tripCountry())+'" placeholder="e.g. UAE">'+
+        '<datalist id="ts-countries">'+(typeof COUNTRY_NAMES !== "undefined" ? COUNTRY_NAMES : []).map(function(n){ return '<option value="'+esc(n)+'">'; }).join("")+'</datalist></div>'+
+      '<div class="field" style="flex:1;min-width:0;"><label>Currency there</label><select id="ts-cur">'+
+        (typeof CURRENCY_INFO !== "undefined" ? Object.keys(CURRENCY_INFO) : ["INR","LKR"]).map(function(c){ return '<option value="'+c+'"'+(c===tripCur()?" selected":"")+'>'+c+' · '+esc(curInfo(c).name)+'</option>'; }).join("")+
+      '</select></div>'+
+    '</div>'+
+    '<div class="split-hint" id="ts-cur-note" style="margin:-6px 0 14px;"></div>'+
+    '<div id="ts-fx-wrap"></div>'+
     '<div class="field"><label>Budget (whole group, in ₹)</label>'+budRows+
       '<div class="split-hint" id="ts-budtotal"></div></div>'+
     '<div class="sheet-actions"><button class="btn btn-brand" id="ts-save">Save</button></div>',
@@ -1455,14 +1503,7 @@ function openTripSettingsSheet(){
       guardSheet(el, "Close Trip settings without saving?");
       var startIn = el.querySelector("#ts-start"), endIn = el.querySelector("#ts-end");
 
-      el.querySelector("#ts-share").addEventListener("click", function(){
-        var link = appLink(), text = "Join our Sri Lanka trip on Project W — open the link, sign in with Google and tap Ask to join.";
-        if(navigator.share){
-          navigator.share({ title:"Project W", text:text, url:link }).catch(function(){});
-        } else if(navigator.clipboard){
-          navigator.clipboard.writeText(text+"\n"+link).then(function(){ toast("Link copied"); }, function(){ toast(link); });
-        } else toast(link);
-      });
+      el.querySelector("#ts-share").addEventListener("click", shareInvite);
 
       function lenHint(){
         var a = ymdToDate(startIn.value), b = ymdToDate(endIn.value);
@@ -1500,32 +1541,58 @@ function openTripSettingsSheet(){
       lenHint();
       budTotal();
 
-      fetchLkrPerInr(todayYmd()).then(function(r){
-        var m = el.querySelector("#ts-market");
-        if(!m) return;
-        m.innerHTML = "Today's market rate: ₹1 = "+r.rate+" LKR. Airport counters usually give a little less. "+
-          '<a href="#" id="ts-use-market">Use this</a>';
-        el.querySelector("#ts-use-market").addEventListener("click", function(e){
-          e.preventDefault();
-          el.querySelector("#ts-rate").value = r.rate;
+      // Country → currency: typing "UAE" switches the currency to AED (it can
+      // still be changed by hand), and the airport-rate box follows it.
+      var countryIn = el.querySelector("#ts-country"), curSel = el.querySelector("#ts-cur");
+      var rateEl = null, fxSeq = 0;
+      function drawFx(){
+        var cur = curSel.value, wrap = el.querySelector("#ts-fx-wrap"), seq = ++fxSeq;
+        if(!isForeign(cur)){ wrap.innerHTML = ""; rateEl = null; return; }
+        wrap.innerHTML = '<div class="field"><label>Airport exchange rate ('+esc(cur)+')</label>'+
+          '<div class="fx-line">'+rateInputHtml("ts-rate", cur, 90)+'</div>'+
+          '<div class="split-hint" id="ts-market">Checking today\'s market rate…</div></div>';
+        rateEl = el.querySelector("#ts-rate");
+        if(cur === tripCur()) rateEl.value = rateToInput(st.airportRate, cur);
+        fetchRate(cur, todayYmd()).then(function(r){
+          var m = el.querySelector("#ts-market");
+          if(!m || seq !== fxSeq) return;
+          m.innerHTML = "Today's market rate: "+esc(rateText(r.rate, cur))+". Airport counters usually give a little less. "+
+            '<a href="#" id="ts-use-market">Use this</a>';
+          el.querySelector("#ts-use-market").addEventListener("click", function(e){
+            e.preventDefault();
+            el.querySelector("#ts-rate").value = rateToInput(r.rate, cur);
+          });
+        }).catch(function(){
+          var m = el.querySelector("#ts-market");
+          if(m && seq === fxSeq) m.textContent = "Enter the rate from your airport exchange receipt.";
         });
-      }).catch(function(){
-        var m = el.querySelector("#ts-market");
-        if(m) m.textContent = "Enter the rate from your airport exchange receipt (LKR you got for ₹1).";
+      }
+      function curNote(){
+        var cur = curSel.value, n = el.querySelector("#ts-cur-note");
+        n.textContent = !isForeign(cur) ? "Bills will be in ₹ only."
+          : ("New bills can be entered in ₹ or " + cur + "." + (cur !== tripCur() ? " Bills already added keep their own currency." : ""));
+      }
+      countryIn.addEventListener("input", function(){
+        var c = typeof currencyForCountry === "function" ? currencyForCountry(countryIn.value) : null;
+        if(c && c !== curSel.value){ curSel.value = c; drawFx(); curNote(); }
       });
+      curSel.addEventListener("change", function(){ drawFx(); curNote(); });
+      drawFx(); curNote();
 
       el.querySelector("#ts-save").addEventListener("click", function(){
         var budget = {};
         el.querySelectorAll('[data-role="bud"]').forEach(function(i){
           budget[i.dataset.id] = Math.max(0, Math.round(Number(i.value) || 0));
         });
-        var rateVal = el.querySelector("#ts-rate").value.trim();
+        var rateVal = rateEl ? rateEl.value.trim() : "";
         if(startIn.value !== S.settings.startDate && ymdToDate(startIn.value) &&
            !window.confirm("Move the whole trip to start on "+fmtYmdShort(startIn.value)+"? Every day of the plan moves with it, for everyone.")) return;
         writeOp(saveTripSettings({
           startDate: startIn.value,
           endDate: endIn.value,
-          airportRate: rateVal === "" ? null : Number(rateVal),
+          country: countryIn.value,
+          currency: curSel.value,
+          airportRate: rateVal === "" ? null : inputToRate(rateVal, curSel.value),
           budget: budget
         }), "Trip settings saved", this);
       });
@@ -1564,20 +1631,31 @@ function viewBalances(){
       ' · '+S.people.length+' people joined</div>';
 }
 
+var showOldBills = false;
 function viewBills(){
+  var cur = tripBills(), old = S.bills.filter(function(b){ return billTrip(b) !== S.settings.tripId; });
   if(!S.bills.length){
     return '<button class="btn btn-brand btn-wide scan-cta" data-action="scan-bill">📷 Scan a bill</button>'+
       '<div class="empty"><span class="big">🧾</span>No bills yet<br>Scan a receipt, or tap + to type one in.</div>';
   }
-  var sorted = S.bills.slice().sort(function(a,b){
-    return String(b.billDate).localeCompare(String(a.billDate)) || String(b.createdAt).localeCompare(String(a.createdAt));
-  });
-  var groups = [], byDate = {};
-  sorted.forEach(function(b){
-    var k = b.billDate || "";
-    if(!byDate[k]){ byDate[k] = { date:k, bills:[], total:0 }; groups.push(byDate[k]); }
-    byDate[k].bills.push(b); byDate[k].total += b.amount;
-  });
+  function groupsOf(list){
+    var sorted = list.slice().sort(function(a,b){
+      return String(b.billDate).localeCompare(String(a.billDate)) || String(b.createdAt).localeCompare(String(a.createdAt));
+    });
+    var groups = [], byDate = {};
+    sorted.forEach(function(b){
+      var k = b.billDate || "";
+      if(!byDate[k]){ byDate[k] = { date:k, bills:[], total:0 }; groups.push(byDate[k]); }
+      byDate[k].bills.push(b); byDate[k].total += b.amount;
+    });
+    return groups.map(function(g){
+      var d = ymdToDate(g.date);
+      return '<div class="section-label" style="display:flex;justify-content:space-between;">'+
+          '<span>'+(d ? esc(WEEKDAY_LONG[d.getDay()].slice(0,3)+" "+fmtDayMonth(d)) : "No date")+'</span>'+
+          '<span style="font-weight:600;">'+esc(inr(g.total))+'</span></div>'+
+        '<div class="card">'+g.bills.map(row).join("")+'</div>';
+    }).join("");
+  }
   function row(b){
     var splitTxt;
     if(b.splitMode==="itemized"){
@@ -1594,22 +1672,22 @@ function viewBills(){
       '<div class="bill-mid"><div class="bill-desc">'+esc(b.desc)+'</div>'+
       '<div class="bill-sub">'+esc(b.paidBy === S.me ? "You" : pName(b.paidBy))+' paid · '+splitTxt+'</div>'+
       '<div class="bill-sub bill-mine">'+(mine > 0 ? 'Your share '+esc(inr(mine)) : 'Not in your share')+'</div></div>'+
-      '<div class="bill-amt">'+(b.currency==="LKR" && b.origAmount
-        ? fmtLkr(b.origAmount)+'<div class="bill-sub" style="text-align:right;">'+inr(b.amount)+'</div>'
+      '<div class="bill-amt">'+(isForeign(b.currency) && b.origAmount
+        ? esc(money(b.origAmount, b.currency))+'<div class="bill-sub" style="text-align:right;">'+inr(b.amount)+'</div>'
         : inr(b.amount))+'</div></div>';
   }
-  var total = S.bills.reduce(function(s,b){ return s+b.amount; }, 0);
-  var mineTotal = S.bills.reduce(function(s,b){ return s + (Number(billShares(b)[S.me]) || 0); }, 0);
+  var total = cur.reduce(function(s,b){ return s+b.amount; }, 0);
+  var mineTotal = cur.reduce(function(s,b){ return s + (Number(billShares(b)[S.me]) || 0); }, 0);
+  var oldTotal = old.reduce(function(s,b){ return s+b.amount; }, 0);
   return '<button class="btn btn-brand btn-wide scan-cta" data-action="scan-bill">📷 Scan a bill</button>'+
-    '<div class="muted" style="font-size:12px;padding:0 2px 2px;">'+S.bills.length+' bill'+(S.bills.length===1?"":"s")+' · '+inr(total)+' total · your share '+inr(mineTotal)+'</div>'+
-    groups.map(function(g){
-      var d = ymdToDate(g.date);
-      return '<div class="section-label" style="display:flex;justify-content:space-between;">'+
-          '<span>'+(d ? esc(WEEKDAY_LONG[d.getDay()].slice(0,3)+" "+fmtDayMonth(d)) : "No date")+'</span>'+
-          '<span style="font-weight:600;">'+esc(inr(g.total))+'</span></div>'+
-        '<div class="card">'+g.bills.map(row).join("")+'</div>';
-    }).join("")+
-    '<div class="muted" style="font-size:11.5px;padding:8px 2px;">Tap a bill to see the split, or to edit it if you added it.</div>';
+    (cur.length
+      ? '<div class="muted" style="font-size:12px;padding:0 2px 2px;">'+esc(hasTrip() ? tripTitle() : 'Before the trip')+' · '+cur.length+' bill'+(cur.length===1?"":"s")+' · '+inr(total)+' total · your share '+inr(mineTotal)+'</div>'+groupsOf(cur)
+      : '<div class="empty" style="padding:22px 10px;"><span class="big">🧾</span>No bills '+(hasTrip() ? 'for '+esc(tripTitle())+' ' : '')+'yet<br>Scan a receipt, or tap + to type one in.</div>')+
+    (old.length
+      ? '<button class="btn btn-ghost btn-wide" data-action="toggle-old-bills" style="margin-top:14px;">'+(showOldBills ? "Hide" : "Show")+' earlier trips · '+old.length+' bill'+(old.length===1?"":"s")+' · '+inr(oldTotal)+'</button>'+
+        (showOldBills ? groupsOf(old) : '')
+      : '')+
+    '<div class="muted" style="font-size:11.5px;padding:8px 2px;">Tap a bill to see the split, or to edit it if you added it. Balances include every trip.</div>';
 }
 
 var showAllPayments = false;
@@ -1988,6 +2066,16 @@ function loadTesseract(){
   return tesseractLoadPromise;
 }
 
+/** Does the receipt look like it's in the trip's own currency? */
+var CUR_HINTS = { LKR:/\bLKR\b|රු/i, THB:/\bTHB\b|฿|บาท/i, IDR:/\bIDR\b|\bRp\.?\s?\d/i, VND:/\bVND\b|₫|\bđ\b/i, AED:/\bAED\b|\bDhs?\b/i,
+  SGD:/\bSGD\b|S\$/i, MYR:/\bMYR\b|\bRM\s?\d/i, USD:/\bUSD\b|US\$/i, NPR:/\bNPR\b|\bNRs\b/i, BTN:/\bBTN\b|\bNu\.?\s?\d/i,
+  MUR:/\bMUR\b/i, JPY:/\bJPY\b|¥|円/i, GEL:/\bGEL\b|₾/i, KZT:/\bKZT\b|₸/i, PHP:/\bPHP\b|₱/i, SCR:/\bSCR\b/i, TRY:/\bTRY\b|₺|\bTL\b/i,
+  HKD:/\bHKD\b|HK\$/i, AZN:/\bAZN\b|₼/i, EUR:/\bEUR\b|€/i };
+function foreignOnReceipt(text){
+  var c = tripCur();
+  return !!(isForeign(c) && CUR_HINTS[c] && CUR_HINTS[c].test(String(text||"")));
+}
+
 /* ---- Reading receipt text ----
    Every priced line becomes one of:
      item     — something someone ate/bought
@@ -2073,6 +2161,8 @@ function classifyReceiptLine(desc, negative){
       lines are dropped.
     - Stops at the grand total (cash, change etc. are ignored). */
 function parseReceiptLines(rawText){
+  // Rupiah / dong receipts write 150.000 for 150,000.
+  if(isForeign(tripCur()) && curInfo(tripCur()).ref > 50) rawText = String(rawText||"").replace(/\b(\d{1,3})((?:\.\d{3})+)(?![\d,])/g, function(m, a, b){ return a + b.replace(/\./g, ","); });
   var raw = String(rawText||"").split(/\r?\n/).map(function(l){ return l.replace(/\s+$/,""); }).filter(function(l){ return l.trim().length > 1; });
   var out = [], receiptTotal = null, receiptSubtotal = null, expectedItems = null;
 
@@ -2334,7 +2424,7 @@ function scanReceiptImage(file, btn){
     var text = result && result.data && result.data.text || "";
     var lines = parseReceiptLines(text);
     lines.title = guessReceiptTitle(text);
-    lines.lkr = /\bLKR\b|රු/i.test(text);
+    lines.foreign = foreignOnReceipt(text);
     lines.photoUrl = prepared.photoUrl;
     return lines;
   }).catch(function(err){
@@ -2503,8 +2593,8 @@ function guessCategory(desc){
   return null;
 }
 
-/** During the trip dates new bills start in LKR; before/after, in ₹. */
-function defaultCurrency(){ return isDuringTrip() ? "LKR" : "INR"; }
+/** During the trip dates new bills start in the trip's currency; before/after, in ₹. */
+function defaultCurrency(){ return (isDuringTrip() && isForeign(tripCur())) ? tripCur() : "INR"; }
 
 function newDraftItem(desc, amount){
   draftItemSeq++;
@@ -2529,19 +2619,24 @@ function openBillSheet(existing, resumeDraft, autoScan){
             : { rate:null, source: (lsGet("pw_last_fxsrc") === "airport" ? "airport" : "day"), date:null };
     draftItems = (existing && existing.items) ? existing.items.map(function(it){
       draftItemSeq++;
-      var shown = (draftCurrency === "LKR" && Number(it.origAmount) > 0) ? Number(it.origAmount) : it.amount;
+      var shown = (isForeign(draftCurrency) && Number(it.origAmount) > 0) ? Number(it.origAmount) : it.amount;
       return { localId:"it"+draftItemSeq, desc:it.desc, amount:shown, people:(it.people||[]).slice(), mode:it.mode||"equal", percents:Object.assign({},it.percents||{}) };
     }) : [];
     draftExtraSeq = 0;
     draftExtras = (existing && existing.extras) ? existing.extras.map(function(x){
-      var shown = (draftCurrency === "LKR" && Number(x.origAmount) > 0) ? Number(x.origAmount) : x.amount;
+      var shown = (isForeign(draftCurrency) && Number(x.origAmount) > 0) ? Number(x.origAmount) : x.amount;
       return newDraftExtra(x.desc, x.kind, "amount", shown, x.pct);
     }) : [];
     draftReceiptTotal = null;
   }
   /** Formats an amount in the bill's own currency (what's being typed). */
   function cm(v){ return money(v, draftCurrency); }
-  var curChips = [["INR","₹ Indian"],["LKR","Rs Sri Lankan"]].map(function(c){
+  // The bill's foreign currency: the trip's, or whatever an older bill was entered in.
+  var foreignCur = (existing && isForeign(existing.currency)) ? existing.currency : (isForeign(draftCurrency) ? draftCurrency : tripCur());
+  if(isForeign(draftCurrency) && draftCurrency !== foreignCur) draftCurrency = foreignCur;
+  var curOpts = [["INR","₹ Indian"]];
+  if(isForeign(foreignCur)) curOpts.push([foreignCur, curInfo(foreignCur).sym + " " + curInfo(foreignCur).name.replace(/ (rupee|dollar|baht|rupiah|dong|dirham|ringgit|ngultrum|yen|lari|tenge|peso|lira|manat)$/i, "")]);
+  var curChips = curOpts.map(function(c){
     return '<div class="chip'+(draftCurrency===c[0]?" on":"")+'" data-role="cur" data-id="'+c[0]+'">'+c[1]+'</div>';
   }).join("");
 
@@ -2676,16 +2771,16 @@ function openBillSheet(existing, resumeDraft, autoScan){
       '<div class="field" style="flex:0 0 42%;"><label>Date</label><input type="date" id="b-date" value="'+esc(draftBillDate)+'" max="'+esc(dateToYmd(addDays(new Date(),1)))+'"></div>'+
       '<div class="field" style="flex:1;"><label>Paid in</label><div class="chip-grid">'+curChips+'</div></div>'+
     '</div>'+
-    '<div class="fx-box" id="b-fx" style="display:'+(draftCurrency==="LKR"?"block":"none")+';">'+
+    '<div class="fx-box" id="b-fx" style="display:'+(isForeign(draftCurrency)?"block":"none")+';">'+
       '<div class="chip-grid" style="margin-bottom:8px;">'+
         '<div class="chip" data-role="fxsrc" data-id="day">📈 That day\'s rate</div>'+
         '<div class="chip" data-role="fxsrc" data-id="airport">🛫 Airport rate</div>'+
       '</div>'+
-      '<div class="fx-line">₹1 = <input type="number" inputmode="decimal" step="0.01" id="b-rate" class="split-input" style="width:84px;" placeholder="3.45"> LKR</div>'+
+      '<div class="fx-line">'+(isForeign(foreignCur) ? rateInputHtml("b-rate", foreignCur, 84) : '<input type="hidden" id="b-rate">')+'</div>'+
       '<div class="split-hint" id="b-fx-note"></div>'+
     '</div>'+
     '<div class="field" id="b-amount-field" style="display:'+(draftMode==="itemized"?"none":"block")+';"><label>Amount</label><div class="amount-field"><span class="rupee cur-sym">'+curSymbol(draftCurrency)+'</span>'+
-      '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+esc(resumeDraft && draftAmountText != null ? draftAmountText : (existing ? (existing.currency==="LKR" && existing.origAmount ? existing.origAmount : existing.amount) : ""))+'"></div><div class="split-hint" id="b-conv"></div></div>'+
+      '<input type="number" inputmode="decimal" id="b-amount" placeholder="0" value="'+esc(resumeDraft && draftAmountText != null ? draftAmountText : (existing ? (isForeign(existing.currency) && existing.origAmount ? existing.origAmount : existing.amount) : ""))+'"></div><div class="split-hint" id="b-conv"></div></div>'+
     '<div class="field"><label>Category</label><div class="chip-grid">'+catChips+'</div></div>'+
     '<div class="field"><label>Who paid</label><div class="chip-grid">'+payChips+'</div></div>'+
     '<div class="field"><label>Split</label><div class="chip-grid" style="margin-bottom:10px;">'+modeChips+'</div>'+
@@ -2710,21 +2805,22 @@ function openBillSheet(existing, resumeDraft, autoScan){
       function amt(){ return parseFloat(el.querySelector("#b-amount").value) || 0; }
 
       /* ---- currency / exchange rate ---- */
-      var fxStatus = validRate(draftFx.rate) ? "ok" : "none";
+      var fxStatus = validRate(draftFx.rate, foreignCur) ? "ok" : "none";
+      var useAirport = foreignCur === tripCur() && validRate(S.settings.airportRate, foreignCur);
 
       function updateConv(){
         var total = draftMode === "itemized" ? grandTotal() : amt();
         // ₹ shown = sum of each line converted, exactly as it will be saved.
         var inrTotal = null;
-        if(draftCurrency === "LKR" && validRate(draftFx.rate)){
+        if(isForeign(draftCurrency) && validRate(draftFx.rate, draftCurrency)){
           if(draftMode === "itemized"){
             inrTotal = draftItems.reduce(function(s,it){ return round2(s + (Number(it.amount) > 0 ? lkrToInr(it.amount, draftFx.rate) : 0)); }, 0);
             resolvedExtras().forEach(function(x){ inrTotal = round2(inrTotal + (x.kind==="discount" ? -1 : 1) * lkrToInr(x.amount, draftFx.rate)); });
           } else inrTotal = lkrToInr(total, draftFx.rate);
         }
         var txt = "";
-        if(draftCurrency === "LKR"){
-          txt = inrTotal != null ? ("= " + inr(inrTotal) + " at ₹1 = " + draftFx.rate + " LKR") : "Waiting for the exchange rate…";
+        if(isForeign(draftCurrency)){
+          txt = inrTotal != null ? ("= " + inr(inrTotal) + " at " + rateText(draftFx.rate, draftCurrency)) : "Waiting for the exchange rate…";
         }
         var c = el.querySelector("#b-conv"); if(c) c.textContent = txt;
         var t = el.querySelector("#b-items-total");
@@ -2756,19 +2852,19 @@ function openBillSheet(existing, resumeDraft, autoScan){
       }
 
       function updateFxUI(){
-        el.querySelector("#b-fx").style.display = draftCurrency === "LKR" ? "block" : "none";
+        el.querySelector("#b-fx").style.display = isForeign(draftCurrency) ? "block" : "none";
         el.querySelectorAll('[data-role="cur"]').forEach(function(x){ x.classList.toggle("on", x.dataset.id === draftCurrency); });
         el.querySelectorAll('[data-role="fxsrc"]').forEach(function(x){ x.classList.toggle("on", x.dataset.id === draftFx.source); });
         el.querySelectorAll(".cur-sym").forEach(function(x){ x.textContent = curSymbol(draftCurrency); });
         var rateIn = el.querySelector("#b-rate");
-        if(document.activeElement !== rateIn) rateIn.value = validRate(draftFx.rate) ? draftFx.rate : "";
+        if(document.activeElement !== rateIn) rateIn.value = validRate(draftFx.rate, foreignCur) ? rateToInput(draftFx.rate, foreignCur) : "";
         var note = "";
         if(fxStatus === "loading") note = "Getting the rate for " + fmtYmdShort(draftBillDate) + "…";
         else if(fxStatus === "noairport") note = "No airport rate saved yet — add it in ⚙️ Trip settings (Plan tab), or type the rate above.";
         else if(fxStatus === "error") note = "Couldn't get the rate (no signal?). Type it above, or save an airport rate in Trip settings.";
         else if(fxStatus === "fellback") note = "No signal for the day's rate — using your airport rate instead.";
-        else if(draftFx.source === "day" && validRate(draftFx.rate)) note = "Market rate for " + fmtYmdShort(draftFx.date) + ".";
-        else if(draftFx.source === "airport" && validRate(draftFx.rate)) note = "Your group's airport rate.";
+        else if(draftFx.source === "day" && validRate(draftFx.rate, foreignCur)) note = "Market rate for " + fmtYmdShort(draftFx.date) + ".";
+        else if(draftFx.source === "airport" && validRate(draftFx.rate, foreignCur)) note = "Your group's airport rate.";
         else if(draftFx.source === "manual") note = "Rate typed in by hand.";
         el.querySelector("#b-fx-note").textContent = note;
         updateConv();
@@ -2776,21 +2872,21 @@ function openBillSheet(existing, resumeDraft, autoScan){
       }
 
       function resolveRate(){
-        if(draftCurrency !== "LKR"){ updateFxUI(); return; }
+        if(!isForeign(draftCurrency)){ updateFxUI(); return; }
         var token = ++fxToken;
         if(draftFx.source === "airport"){
-          if(validRate(S.settings.airportRate)){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "ok"; }
+          if(useAirport){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "ok"; }
           else { draftFx.rate = null; fxStatus = "noairport"; }
           updateFxUI(); return;
         }
-        if(draftFx.source === "manual"){ fxStatus = validRate(draftFx.rate) ? "ok" : "none"; updateFxUI(); return; }
+        if(draftFx.source === "manual"){ fxStatus = validRate(draftFx.rate, foreignCur) ? "ok" : "none"; updateFxUI(); return; }
         fxStatus = "loading"; updateFxUI();
-        fetchLkrPerInr(draftBillDate).then(function(r){
+        fetchRate(foreignCur, draftBillDate).then(function(r){
           if(token !== fxToken || openSheetEl !== el) return;
           draftFx = { rate:r.rate, source:"day", date:r.date }; fxStatus = "ok"; updateFxUI();
         }).catch(function(){
           if(token !== fxToken || openSheetEl !== el) return;
-          if(validRate(S.settings.airportRate)){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "fellback"; }
+          if(useAirport){ draftFx = { rate:S.settings.airportRate, source:"airport", date:draftBillDate }; fxStatus = "fellback"; }
           else { draftFx = { rate:null, source:"day", date:null }; fxStatus = "error"; }
           updateFxUI();
         });
@@ -2802,26 +2898,26 @@ function openBillSheet(existing, resumeDraft, autoScan){
           fxToken++;
           var typed = el.querySelector("#b-amount").value;
           draftCurrency = c.dataset.id;
-          if(typed) toast("Amount "+typed+" is now in "+(draftCurrency === "LKR" ? "LKR" : "₹")+" — check it's right");
-          if(draftCurrency === "LKR" && !validRate(draftFx.rate)) resolveRate(); else updateFxUI();
+          if(typed) toast("Amount "+typed+" is now in "+(isForeign(draftCurrency) ? draftCurrency : "₹")+" — check it's right");
+          if(isForeign(draftCurrency) && !validRate(draftFx.rate, draftCurrency)) resolveRate(); else updateFxUI();
         });
       });
       el.querySelectorAll('[data-role="fxsrc"]').forEach(function(c){
         c.addEventListener("click", function(){ draftFx = { rate:null, source:c.dataset.id, date:null }; resolveRate(); });
       });
       el.querySelector("#b-rate").addEventListener("input", function(){
-        var v = parseFloat(this.value);
+        var v = inputToRate(this.value, foreignCur);
         fxToken++;   // typing a rate beats any lookup still in flight
-        draftFx = { rate: validRate(v) ? Math.round(v*10000)/10000 : null, source:"manual", date:draftBillDate };
-        fxStatus = validRate(v) ? "ok" : "none";
+        draftFx = { rate: validRate(v, foreignCur) ? v : null, source:"manual", date:draftBillDate };
+        fxStatus = validRate(v, foreignCur) ? "ok" : "none";
         el.querySelectorAll('[data-role="fxsrc"]').forEach(function(x){ x.classList.remove("on"); });
-        el.querySelector("#b-fx-note").textContent = validRate(v) ? "Rate typed in by hand." : "Enter LKR for ₹1, e.g. 3.45";
+        el.querySelector("#b-fx-note").textContent = validRate(v, foreignCur) ? "Rate typed in by hand." : ("Usually around " + rateText(curInfo(foreignCur).ref, foreignCur));
         updateConv(); hint();
       });
       el.querySelector("#b-date").addEventListener("change", function(){
         if(!ymdToDate(this.value)) return;
         draftBillDate = this.value;
-        if(draftCurrency === "LKR" && draftFx.source === "day") resolveRate();
+        if(isForeign(draftCurrency) && draftFx.source === "day") resolveRate();
       });
 
       function hint(){
@@ -2974,7 +3070,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
       wireSplitSection();
       hint();
       el.querySelector("#b-amount").addEventListener("input", function(){ hint(); updateConv(); });
-      if(draftCurrency === "LKR" && !validRate(draftFx.rate)) resolveRate(); else updateFxUI();
+      if(isForeign(draftCurrency) && !validRate(draftFx.rate, draftCurrency)) resolveRate(); else updateFxUI();
 
       el.querySelectorAll('[data-role="paid"]').forEach(function(c){
         c.addEventListener("click", function(){
@@ -3050,7 +3146,7 @@ function openBillSheet(existing, resumeDraft, autoScan){
           draftAmountText = el.querySelector("#b-amount").value;
           var existingSnapshot = existing;
           var prevCurrency = draftCurrency;
-          if(lines.lkr) draftCurrency = "LKR";   // so the review list shows LKR
+          if(lines.foreign && isForeign(foreignCur)) draftCurrency = foreignCur;   // so the review list shows the right currency
           openReceiptReviewSheet(lines, function(res){
             draftMode = "itemized";
             // Drop blank placeholder rows so they don't block saving.
@@ -3089,13 +3185,13 @@ function openBillSheet(existing, resumeDraft, autoScan){
           category: draftCat, paidBy: draftPaidBy,
           splitMode: draftMode,
           currency: draftCurrency, billDate: draftBillDate,
-          fx: draftCurrency === "LKR" ? Object.assign({}, draftFx) : null
+          fx: isForeign(draftCurrency) ? Object.assign({}, draftFx) : null
         };
-        if(draftCurrency === "LKR" && !validRate(draftFx.rate)){
+        if(isForeign(draftCurrency) && !validRate(draftFx.rate, draftCurrency)){
           toast(fxStatus === "loading" ? "Still getting the exchange rate — one sec" : "Set the exchange rate first", true); return;
         }
         lsSet("pw_last_cur", draftCurrency);
-        if(draftCurrency === "LKR" && draftFx.source !== "manual") lsSet("pw_last_fxsrc", draftFx.source);
+        if(isForeign(draftCurrency) && draftFx.source !== "manual") lsSet("pw_last_fxsrc", draftFx.source);
         if(draftMode==="itemized"){
           payload.items = draftItems.map(function(it){
             return { desc:it.desc, amount:it.amount, people:it.people.slice(), mode:it.mode, percents:Object.assign({},it.percents) };
@@ -3237,6 +3333,9 @@ document.addEventListener("click", function(e){
   }
   else if(a==="trip-settings"){
     openTripSettingsSheet();
+  }
+  else if(a==="toggle-old-bills"){
+    showOldBills = !showOldBills; render();
   }
   else if(a==="goto-bills"){
     setTab("bills");
@@ -3509,6 +3608,7 @@ function teardown(){
   latestSnapshots = { people:null, bills:null, settlements:null, itinerary:null, trip:null };
   stopRequestsListener();
   stopJoinWatch();
+  if(typeof plannerStop === "function") plannerStop();
   adminsCreating = false;
   itinerarySeeded = false;
   if(nowTimer){ clearInterval(nowTimer); nowTimer = null; }

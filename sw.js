@@ -5,13 +5,13 @@
      load, then served from the phone.
    - Firestore, Google sign-in and exchange rates are never touched here —
      Firestore has its own offline cache and the app caches rates itself. */
-var VERSION = "pw-v1";
+var VERSION = "pw-v2";
 var APP_CACHE = VERSION + "-app";
 var LIB_CACHE = "pw-libs-v1";
 // Caches are shared with other apps on this github.io address, so only ever
 // touch the ones that start with "pw-".
 
-var APP_FILES = ["./", "index.html", "app.js", "firebase-config.js", "manifest.json",
+var APP_FILES = ["./", "index.html", "app.js", "planner-data.js", "planner.js", "firebase-config.js", "manifest.json",
                  "icon-192.png", "icon-180.png", "icon-512.png", "favicon.png"];
 var LIB_FILES = [
   "https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js",
