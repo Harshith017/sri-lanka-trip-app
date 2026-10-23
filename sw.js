@@ -5,7 +5,7 @@
      load, then served from the phone.
    - Firestore, Google sign-in and exchange rates are never touched here —
      Firestore has its own offline cache and the app caches rates itself. */
-var VERSION = "pw-v2";
+var VERSION = "pw-v3";
 var APP_CACHE = VERSION + "-app";
 var LIB_CACHE = "pw-libs-v1";
 // Caches are shared with other apps on this github.io address, so only ever
